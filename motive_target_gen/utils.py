@@ -6,8 +6,6 @@ import cv2
 import numpy as np
 
 
-
-
 # 灰体辐射强度计算函数
 def radiation_wavelength(epsilon, T, wavelength, r):
     """
@@ -50,7 +48,6 @@ def generate_arrays(M, N):
     arrays = []
     corresponding_sums = []
 
-    # 生成M个数组
     for _ in range(M):
         length = random.randint(1, N)  # 数组的长度在1到N之间
         array = [
