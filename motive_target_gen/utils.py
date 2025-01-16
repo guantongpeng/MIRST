@@ -69,13 +69,12 @@ def generate_arrays(M, N):
 
 def load_images_from_folder(folder):
     """
-    Load images from a specified folder.
+    Load images from a specified folder in alphabetical order of filenames.
     """
     images = []
 
-    for filename in sorted(
-        os.listdir(folder), key=lambda x: int(re.search(r"\d+", x).group())
-    ):
+    # Sort filenames alphabetically
+    for filename in sorted(os.listdir(folder)):
         img_path = os.path.join(folder, filename)
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is not None:
