@@ -25,8 +25,8 @@ def circle_gen(h, w, target, scale, background_std, background_mean):
     for i in range(h):
         for j in range(w):
             if (i - center[0]) ** 2 + (j - center[1]) ** 2 <= radius ** 2:
-                _temp = np.exp(-((i - center[0]) ** 2 + (j - center[1]) ** 2) / (2 * (radius ** 2))) * scale
-                target[i, j] = np.clip(_temp * background_std + background_mean, 0, 255)
+                gaussion_values = np.exp(-((i - center[0]) ** 2 + (j - center[1]) ** 2) / (2 * (radius ** 2))) * scale
+                target[i, j] = np.clip(gaussion_values * background_std + background_mean, 0, 255)
                 
     return 
 
@@ -54,8 +54,8 @@ def ellipse_gen(h, w, target, scale, background_std, background_mean, axis=None)
     for i in range(h):
         for j in range(w):
             if ((i - center[0]) ** 2 / (axis1 ** 2) + (j - center[1]) ** 2 / (axis2 ** 2)) <= 1:
-                _temp = np.exp(-(((i - center[0]) ** 2 / (axis1 ** 2)) + ((j - center[1]) ** 2 / (axis2 ** 2)))) * scale
-                target[i, j] = np.clip(_temp * background_std + background_mean, 0, 255)
+                gaussion_values = np.exp(-(((i - center[0]) ** 2 / (axis1 ** 2)) + ((j - center[1]) ** 2 / (axis2 ** 2)))) * scale
+                target[i, j] = np.clip(gaussion_values * background_std + background_mean, 0, 255)
                 
     return axis1, axis2
 
@@ -101,10 +101,18 @@ def polygon_gen(h, w, target, pixel_scale, background_std, background_mean, angl
     return angles
       
 # 初始化参数：中心点、形状（圆形、椭圆、多边形）、大小，像素值
-def target_generator(target, shape_type, background_std, background_mean, background_diff, target_distance=3000, base_distance = 3000, params=None):
+def target_generator(target, 
+                     shape_type, 
+                     background_std, 
+                     background_mean, 
+                     background_diff, 
+                     target_distance=3000, 
+                     base_distance = 3000, 
+                     params=None):
    
     h, w = target.shape
-    eta = np.clip(np.log(np.log(base_distance**2 / target_distance**2 + 1) + 1), 0, 1) # TODO 计算辐射强度折算像素值，待优化
+    # TODO 计算辐射强度折算像素值，待优化
+    eta = np.clip(np.log(np.log(base_distance**2 / target_distance**2 + 1) + 1), 0, 1) 
     scale = background_diff * eta # 基准值原来设计的是scale = 0.5
 
     # 目标初始化，根据形状类型生成目标
@@ -124,9 +132,21 @@ def target_generator(target, shape_type, background_std, background_mean, backgr
 
 
 # 根据不同运动模式计算目标位移
-def get_displacement(motion_mode, init_velocity, max_velocity, direction_coef, acceleration_factor, a0, k, t, fps):
+def get_displacement(motion_mode, 
+                     init_velocity, 
+                     max_velocity, 
+                     direction_coef, 
+                     acceleration_factor, 
+                     a0, 
+                     k, 
+                     frame, 
+                     fps, 
+                     random_accelerations):
+    
     x_coef, y_coef, z_coef = direction_coef
-
+    
+    t = 1 / fps
+    
     if motion_mode == 0:  # 'uniform' 匀速
         velocity = min(init_velocity, max_velocity)  # 确保速度不超过最大速度
         displacement = velocity * t  # 位移随时间线性增加
@@ -142,21 +162,25 @@ def get_displacement(motion_mode, init_velocity, max_velocity, direction_coef, a
         velocity = min(velocity, max_velocity)  # 确保速度不超过最大速度
         displacement = init_velocity * t + 0.5 * a0 * t**2 + (1/6) * k * t**3  # 位移考虑初始速度和变加速
 
-    elif motion_mode == 3:  # 'random_motion' 随机运动
-        # 初始化速度和位移
-        velocity = init_velocity
-        displacement = 0
+    # elif motion_mode == 3:  # 'random_motion' 随机运动
+    #     time_step = 1 / fps  # 使用帧率作为时间步长
 
-        # 动态时间步长
-        time_step = 1 / fps  # 使用帧率作为时间步长
-        num_steps = int(t * fps)  # 计算时间步长内的步数
+    #     # 初始化速度和位移
+    #     velocity = init_velocity
+    #     displacement = 0
 
-        # 随机生成加速度变化
-        random_accelerations = np.random.uniform(-1, 1, num_steps)
-        velocities = np.cumsum(random_accelerations) + velocity
-        velocities = np.clip(velocities, 0, max_velocity)  # 确保速度不超过最大速度
-        displacements = np.cumsum(velocities) * time_step
-        displacement = displacements[-1]
+    #     # 获取前frame个加速度变化
+    #     accelerations = random_accelerations[:frame]
+        
+    #     # 计算速度
+    #     velocity = np.cumsum(accelerations) * acceleration_factor + velocity
+    #     velocity = np.clip(velocity, 0, max_velocity)  # 确保速度不超过最大速度
+
+    #     # 计算位移
+    #     displacements = np.cumsum(velocity) * time_step * direction_coef
+        
+    #     # 获取当前帧的位移
+    #     displacement = displacements[-1] if len(displacements) > 0 else 0
 
     else:
         raise ValueError("Invalid motion mode")
@@ -164,11 +188,27 @@ def get_displacement(motion_mode, init_velocity, max_velocity, direction_coef, a
     displacement_x = displacement * x_coef
     displacement_y = displacement * y_coef
     displacement_z = displacement * z_coef
-    print(displacement_x, displacement_y, displacement_z)
-    return displacement_x, displacement_y, displacement_z
+    return displacement_x, displacement_y, displacement_z, velocity
 
 # 计算所有目标的累计位移
-def get_cumulative_displacements(motion_modes, time_ratios, total_frames, fps, target_init_velocity, max_velocity, target_direction_coef, target_acceleration_factor, init_acceleration, acceleration_change_rate, target_nums, x_range, y_range, z_range, target_positions, img_w, img_h): 
+def get_cumulative_displacements(motion_modes, 
+                                 time_ratios, 
+                                 total_frames, 
+                                 fps, 
+                                 target_init_velocity, 
+                                 max_velocity, 
+                                 target_direction_coef, 
+                                 target_acceleration_factor, 
+                                 init_acceleration, 
+                                 acceleration_change_rate, 
+                                 target_nums, 
+                                 x_range, 
+                                 y_range, 
+                                 z_range, 
+                                 target_positions, 
+                                 img_w, 
+                                 img_h): 
+    
     frame_time = 1 / fps
     all_cumulative_displacements = []
 
@@ -191,26 +231,42 @@ def get_cumulative_displacements(motion_modes, time_ratios, total_frames, fps, t
 
         target_motion_modes, target_time_ratios = motion_modes[target_index], time_ratios[target_index]
         
+        cur_velocity = init_velocity
+        
         for mode, ratio in zip(target_motion_modes, target_time_ratios):
             num_frames = int(ratio * total_frames)
-            for _ in range(num_frames):
-                displacement_x, displacement_y, displacement_z = get_displacement(
-                    mode, init_velocity, max_velocity, direction_coef, acceleration_factor, a0, k, frame_time, fps)
-
+            if mode == 3:
+                random_accelerations = np.random.uniform(-1, 1, num_frames)
+            else:
+                random_accelerations = None
+                
+            for frame in range(num_frames):       
+                displacement_x, displacement_y, displacement_z, cur_velocity = get_displacement(mode, 
+                                                                                                cur_velocity, 
+                                                                                                max_velocity, 
+                                                                                                direction_coef, 
+                                                                                                acceleration_factor, 
+                                                                                                a0, 
+                                                                                                k, 
+                                                                                                frame+1, 
+                                                                                                fps, 
+                                                                                                random_accelerations)
+                
                 cumulative_displacement_x = displacement_x + cumulative_displacement_x
                 cumulative_displacement_y = displacement_y + cumulative_displacement_y
                 cumulative_displacement_z = displacement_z + cumulative_displacement_z
 
                 # 目标移动边界检查是否超出范围，如果超出则调整方向
-                if cumulative_displacement_x < (x0-x_min) or cumulative_displacement_x > (x_max+img_w-x0):
+                if cumulative_displacement_x < (x_min-x0) or cumulative_displacement_x > (x_max+img_w-x0):
                     direction_coef = (-direction_coef[0], direction_coef[1], direction_coef[2])
-                    cumulative_displacement_x = max(min(cumulative_displacement_x, x_max+img_w-x0), x0-x_min)
-                if cumulative_displacement_y < (y0-y_min) or cumulative_displacement_y > (y_max+img_h-y0):
+                    cumulative_displacement_x = max(min(cumulative_displacement_x, x_max+img_w-x0), x_min-x0)
+                if cumulative_displacement_y < (y_min-y0) or cumulative_displacement_y > (y_max+img_h-y0):
                     direction_coef = (direction_coef[0], -direction_coef[1], direction_coef[2])
-                    cumulative_displacement_y = max(min(cumulative_displacement_y, y_max+img_h-y0), y0-y_min)
+                    cumulative_displacement_y = max(min(cumulative_displacement_y, y_max+img_h-y0), y_min-y0)
                 if cumulative_displacement_z < (z_min-z0) or cumulative_displacement_z > (z_max-z0):
                     direction_coef = (direction_coef[0], direction_coef[1], -direction_coef[2])
                     cumulative_displacement_z = max(min(cumulative_displacement_z, z_max-z0), z_min-z0)
+
                 target_cumulative_displacements.append((cumulative_displacement_x, cumulative_displacement_y, cumulative_displacement_z))
 
             if len(target_cumulative_displacements) >= total_frames:
@@ -322,11 +378,15 @@ def MISTG(input_images, max_num_targets):
     # background_displacement_array = np.array(background_displacement_list)
     relative_displacement_array = np.array(relative_displacement_list)
 
-    y_displacement_range_min = np.min(relative_displacement_array[:,0])
-    y_displacement_range_max = np.max(relative_displacement_array[:,0])
-    x_displacement_range_min = np.min(relative_displacement_array[:,1])
-    x_displacement_range_max = np.max(relative_displacement_array[:,1])
-    print("Background Displacement Range, ", "X Range: ", [x_displacement_range_min, x_displacement_range_max], ", Y Range: ", [y_displacement_range_min, y_displacement_range_max])
+    x_displacement_range_min = np.min(relative_displacement_array[:,0])
+    x_displacement_range_max = np.max(relative_displacement_array[:,0])
+    y_displacement_range_min = np.min(relative_displacement_array[:,1])
+    y_displacement_range_max = np.max(relative_displacement_array[:,1])
+      
+    print("Background Displacement Range, ", "X Range: ", 
+          [x_displacement_range_min, x_displacement_range_max], 
+          ", Y Range: ", [y_displacement_range_min, y_displacement_range_max])
+    
     print("Final Background Displacement: ", relative_displacement_array[-1])
     ##############################################################################################################
     
@@ -340,7 +400,7 @@ def MISTG(input_images, max_num_targets):
     max_target_size = 5                                                  # 初始化目标尺寸最大值 m
     min_init_distance = 2000                                             # 最小目标初始化距离 m
     max_init_distance = 5000                                             # 最大目标初始化距离 m   
-    z_range_min = 50                                                     # 目标最近距离，超出距离调转方向
+    z_range_min = 500                                                     # 目标最近距离，超出距离调转方向
     z_range_max = 6500                                                   # 目标最远距离，超出距离调转方向                      
     
     base_distance = 3000                                                 # 目标基准距离，根据此距离修正目标辐射强度以修正像素值
@@ -373,10 +433,14 @@ def MISTG(input_images, max_num_targets):
     y_max = np.floor(y_displacement_range_max + img_h - margin)
     
     # 目标位置初始化
-    target_positions = np.random.randint([x_min, y_min, min_init_distance], [x_max, y_max, max_init_distance], size=(init_target_nums, 3))         # N*3 (x,y,z)
+    target_positions = np.random.randint([x_min, y_min, min_init_distance], 
+                                         [x_max, y_max, max_init_distance], 
+                                         size=(init_target_nums, 3))         # N*3 (x,y,z)
     target_distances = target_positions[::,-1]
-    target_real_size = np.random.randint(min_target_size, max_target_size, size=init_target_nums)          
-    # target_init_velocity = np.random.randint(min_init_velocity, max_init_velocity, size=init_target_nums) # m/s
+    target_real_size = np.random.randint(min_target_size, 
+                                         max_target_size, 
+                                         size=init_target_nums)          
+
     pixel_scale = (target_distances * pixel_size) / F          # 1px distance, 50mm: 5000->1.5m 3000->0.9m
     target_pixel = np.round(target_real_size / pixel_scale)    # 目标占据像素
     # print(target_pixel)
@@ -384,9 +448,7 @@ def MISTG(input_images, max_num_targets):
     
     
     
-    ##################################  first frame target init  ######################################
-    # pixel_displacement = (target_init_velocity / fps) / pixel_scale
-    
+    ##################################  first frame target init  ######################################    
     target_shapes = ['circle', 'ellipse', 'polygon']                                        
     target_shape_ids = np.random.randint(0, len(target_shapes), size=init_target_nums)        # 初始化目标形状
     init_targets_info = []
@@ -403,7 +465,15 @@ def MISTG(input_images, max_num_targets):
         x, y, z = target_positions[j]
  
         img_target_background = input_images[0, y:y+h, x:x+w]
-        init_target_info = target_generator(img_target_background, shape_type, background_std, background_mean, background_diff, z, base_distance=base_distance)
+        
+        init_target_info = target_generator(img_target_background, 
+                                            shape_type, 
+                                            background_std, 
+                                            background_mean, 
+                                            background_diff, 
+                                            z, 
+                                            base_distance=base_distance)
+        
         target = init_target_info['target']       
         init_targets_info.append(init_target_info)
           
@@ -417,23 +487,50 @@ def MISTG(input_images, max_num_targets):
     ##########################################  target update  ##########################################  
 
     # 随机初始化运动速度参数
-    targets_init_velocity = np.random.randint(min_init_velocity, max_init_velocity, size=init_target_nums)
-    targets_acceleration_factor = np.random.uniform(min_acceleration_factor, max_acceleration_factor, size=init_target_nums)
-    targets_init_acceleration = np.random.randint(init_acceleration_range[0], init_acceleration_range[1], size=init_target_nums)
-    targets_acceleration_change_rate = np.random.randint(acceleration_change_rate_range[0], acceleration_change_rate_range[1], size=init_target_nums)
+    targets_init_velocity = np.random.randint(min_init_velocity, 
+                                              max_init_velocity, 
+                                              size=init_target_nums)
+    
+    targets_acceleration_factor = np.random.uniform(min_acceleration_factor, 
+                                                    max_acceleration_factor, 
+                                                    size=init_target_nums)
+    
+    targets_init_acceleration = np.random.randint(init_acceleration_range[0],
+                                                  init_acceleration_range[1], 
+                                                  size=init_target_nums)
+    
+    targets_acceleration_change_rate = np.random.randint(acceleration_change_rate_range[0], 
+                                                         acceleration_change_rate_range[1], 
+                                                         size=init_target_nums)
+    
     motion_modes, time_ratios = generate_arrays(init_target_nums, mode_slice) # 每个目标的运动模式数量在1到4之间
     
     # 初始化目标运动方向参数
     motion_direction = np.random.choice([-1, 1], size=(init_target_nums, 3))   # N, (x,y,z)
     motion_direction_coef = generate_multiple_sets_of_random_numbers(init_target_nums, 3)
-    import pdb
-    pdb.set_trace()
     targets_direction_coef = motion_direction * motion_direction_coef
 
     # 计算出后续全部帧所有目标与第一帧的位移、旋转变化
-    targets_cumulative_displacements = get_cumulative_displacements(motion_modes, time_ratios, img_nums-1, fps, targets_init_velocity, max_velocity, targets_direction_coef, targets_acceleration_factor, targets_init_acceleration, targets_acceleration_change_rate, init_target_nums, [x_displacement_range_min, x_displacement_range_max], [y_displacement_range_min, y_displacement_range_max], [z_range_min, z_range_max], target_positions, img_w, img_h) # return shape:[targets_num, img_num, 3]
-    print(targets_cumulative_displacements)
-    pdb.set_trace()
+    targets_cumulative_displacements = get_cumulative_displacements(motion_modes, 
+                                                                    time_ratios, 
+                                                                    img_nums-1, 
+                                                                    fps, 
+                                                                    targets_init_velocity, 
+                                                                    max_velocity, 
+                                                                    targets_direction_coef, 
+                                                                    targets_acceleration_factor, 
+                                                                    targets_init_acceleration, 
+                                                                    targets_acceleration_change_rate, 
+                                                                    init_target_nums, 
+                                                                    [x_displacement_range_min, x_displacement_range_max], 
+                                                                    [y_displacement_range_min, y_displacement_range_max], 
+                                                                    [z_range_min, z_range_max], 
+                                                                    target_positions, 
+                                                                    img_w, 
+                                                                    img_h) # return shape:[targets_num, img_num, 3]
+    
+    # print(targets_cumulative_displacements)
+
     targets_cumulative_spin = get_cumulative_spin() # TODO
  
       
@@ -448,8 +545,7 @@ def MISTG(input_images, max_num_targets):
 
         # 基于位移与旋转变化和目标初始化信息修改输入参数生成更新后目标
         update_target_positions = target_positions + targets_cumulative_displacements[:, i-1, :] 
-        # import pdb
-        # pdb.set_trace()
+
         update_target_distances = update_target_positions[::,-1]
         update_pixel_scale = (update_target_distances * pixel_size) / F                     
 
@@ -463,20 +559,26 @@ def MISTG(input_images, max_num_targets):
             h = w = int(update_target_pixel[j]) # TODO 待优化
             x, y, z = update_target_positions[j]
 
-            y = int(y - relative_displacement_array[i-1, 0]) # 减去背景位移
-            x = int(x - relative_displacement_array[i-1, 1])
-
+            x = int(x - relative_displacement_array[i-1, 0])
+            y = int(y - relative_displacement_array[i-1, 1]) # 减去背景位移,计算背景坐标变换后物体与新的坐标系的相对位置
+            
             # 判断目标是否显示在图像中，只需要计算在现在这一帧图像内的目标，依据目标中心点和目标大小判定
             # 简化：忽略目标大小，仅依据中心点判定
             if 0 <= x < img_w and 0 <= y < img_h:
                 img_target_background = current_gray[y:y+h, x:x+w]
-                target_info = target_generator(img_target_background, shape_type, background_std, background_mean, background_diff, z, base_distance=base_distance, params=init_targets_info[j]['params'])
+                
+                target_info = target_generator(img_target_background, 
+                                               shape_type, 
+                                               background_std, 
+                                               background_mean, 
+                                               background_diff, 
+                                               z, 
+                                               base_distance=base_distance, 
+                                               params=init_targets_info[j]['params'])
+                
                 target = target_info['target']
                 # Generate targets and add them to the frame
                 output_images[i, y:y+h, x:x+w] = target 
-        
-        # mask = target != 0
-        # output_images[i, max(0, y):min(img_h, y+h), max(0, x):min(img_w, x+w)] = np.where(mask, target, input_images[i, max(0, y):min(img_h, y+h), max(0, x):min(img_w, x+w)])
             
     return output_images, annotations
     ######################################################################################################
@@ -484,8 +586,9 @@ def MISTG(input_images, max_num_targets):
 
 if __name__ == '__main__':
     # 参数配置
-    # folder_path = "/home/guantp/Infrared/datasets/mydata/250110/M615/50_30s_4"   # Replace with your folder containing images
-    folder_path = "/home/guantp/Infrared/MIRST/motive_target_gen/data4"
+    # folder_path = "/home/guantp/Infrared/datasets/mydata/250110/M615/100_1min_4"   # Replace with your folder containing images
+    # folder_path = "/home/guantp/Infrared/MIRST/motive_target_gen/data4"
+    folder_path = "/home/guantp/Infrared/datasets/复杂背景下红外弱小运动目标检测数据集/train/100/"
     output_folder = "/home/guantp/Infrared/MIRST/motive_target_gen/imgs/"
     max_num_targets = 20
     
@@ -496,9 +599,11 @@ if __name__ == '__main__':
     print("Moving Infrared Small Target Generate Finish.")
     
 # TODO 未完成部分以及优化
-# 目标mask生成
+
 # 使用三维模型 + 投影优化目标形状
 # 添加目标自旋转模型
+# 背景抖动模糊图像处理
 # 像素值根据距离和大气传输模型仿真优化
 # 设计合理的运动速度、加速度和变化率
 # 运动参数添加微弱随机扰动
+# 目标mask生成

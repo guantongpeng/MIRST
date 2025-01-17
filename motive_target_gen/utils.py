@@ -54,10 +54,9 @@ def generate_arrays(M, N):
     corresponding_sums = []
 
     for _ in range(M):
-        length = random.randint(1, N)  # 数组的长度在1到N之间
-        array = [
-            random.choice([0, 1, 2, 3]) for _ in range(length)
-        ]  # 随机生成0,1,2,3中的整数
+        length = random.randint(1, N) 
+        # 随机生成0,1,2,3中的整数
+        array = [random.choice([0, 1, 2]) for _ in range(length)]  
         arrays.append(array)
 
         # 生成与该数组长度完全对应的和为1的数组
