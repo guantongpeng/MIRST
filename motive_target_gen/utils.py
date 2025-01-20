@@ -155,3 +155,16 @@ def save_images_and_annotations(output_folder, images, annotations):
 #         for x in range(rotated_template.shape[1]):
 #             if rotated_template[y, x] > 128:  # Threshold to keep only the shape
 #                 target[y + y_offset, x + x_offset] = random.uniform(100, 255)
+
+
+{
+ "proxies":
+ {
+   "default":
+   {
+     "httpProxy": "http://172.16.5.111:2022",
+     "httpsProxy": "http://172.16.5.111:2022",
+     "noProxy": "localhost,127.0.0.1,.daocloud.io"
+   }
+ }
+}
