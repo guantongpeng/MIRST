@@ -157,14 +157,14 @@ def save_images_and_annotations(output_folder, images, annotations):
 #                 target[y + y_offset, x + x_offset] = random.uniform(100, 255)
 
 
-{
- "proxies":
- {
-   "default":
-   {
-     "httpProxy": "http://172.16.5.111:2022",
-     "httpsProxy": "http://172.16.5.111:2022",
-     "noProxy": "localhost,127.0.0.1,.daocloud.io"
-   }
- }
-}
+# 一些之前的想法
+def new_target_gen():
+    # 新动态目标生成
+    return 
+
+def handle_critical_target():
+    # 处理目标消失情况
+    # 1.删除目标
+    # 2.更改目标运动方向
+    # 3.重新初始化目标位置
+    return 

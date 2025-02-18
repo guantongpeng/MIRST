@@ -1,66 +1,186 @@
-import argparse
-import pdb
+import os
+import shutil
 import random
-
+import trimesh
 import cv2
 import numpy as np
-from utils import *
 
+from motive_mode import (
+    get_cumulative_displacements,
+    update_rotation,
+    generate_3d_targets_rotation_sequences
+)
 
-def circle_gen(h, w, target, scale, background_std, background_mean):
+from projection_3d import (
+    normalize_mesh, 
+    get_projection, 
+    calculate_target_angles, 
+    generate_ir_target_intensity
+)
+
+from utils import (
+    generate_multiple_sets_of_random_numbers,
+    generate_arrays,
+    load_images_from_folder
+)
+
+def circle_gen(h, w, target, scale, background_std, background_mean): #TODO 待优化
     """
-    生成一个高斯分布的圆形，并将其绘制到目标图像上。
-    
+    生成一个连续的不规则类圆形红外目标
     参数:
-    - h: 图像的高度
-    - w: 图像的宽度
-    - target: 目标图像
-    - scale: 缩放因子，用于调整圆形的亮度
-    - background_std: 背景标准差，用于生成圆形颜色
-    - background_mean: 背景平均值，用于生成圆形颜色
+    h, w: 目标区域高度和宽度
+    target: 背景图像
+    scale: 目标强度缩放因子
+    background_std: 背景标准差
+    background_mean: 背景均值
     """
     center = (w // 2, h // 2)
     radius = max(min(h, w) // 4, 1)
+    mask = np.zeros((h, w), dtype=np.uint8)
     
-    for i in range(h):
-        for j in range(w):
-            if (i - center[0]) ** 2 + (j - center[1]) ** 2 <= radius ** 2:
-                gaussion_values = np.exp(-((i - center[0]) ** 2 + (j - center[1]) ** 2) / (2 * (radius ** 2))) * scale
-                target[i, j] = np.clip(gaussion_values * background_std + background_mean, 0, 255)
-                
-    return 
+    # 使用矩阵运算
+    y, x = np.ogrid[:h, :w]
+    
+    # 添加形状扭曲，但减小扭曲程度
+    angle = np.random.uniform(0, 2*np.pi)
+    distortion = np.random.uniform(0.85, 1.15, (2,))  # 减小扭曲范围
+    
+    # 坐标变换
+    x_rot = (x - center[0]) * np.cos(angle) + (y - center[1]) * np.sin(angle)
+    y_rot = -(x - center[0]) * np.sin(angle) + (y - center[1]) * np.cos(angle)
+    dist_from_center = np.sqrt((x_rot * distortion[0])**2 + (y_rot * distortion[1])**2)
+    
+    # 使用更平滑的边缘扰动
+    theta = np.arctan2(y - center[1], x - center[0])
+    # 减少高频扰动，使用更低频率的变化
+    edge_noise = 1 + 0.15 * np.cos(2 * theta) + 0.1 * np.sin(2 * theta)
+    # 添加平滑的随机扰动
+    smooth_noise = cv2.GaussianBlur(np.random.normal(0, 0.1, (h, w)), (5, 5), 2)
+    edge_noise += smooth_noise
+    
+    # 创建基础目标区域
+    target_region = (dist_from_center * edge_noise) <= radius
+    
+    # 使用形态学操作确保连续性
+    kernel = np.ones((3, 3), np.uint8)
+    target_region = cv2.morphologyEx(target_region.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+    target_region = cv2.morphologyEx(target_region, cv2.MORPH_OPEN, kernel)
+    
+    # 使用改进的强度计算方式
+    intensity = np.zeros((h, w))
+    valid_region = target_region > 0
+    intensity[valid_region] = np.exp(-0.7 * (dist_from_center[valid_region] / radius)**1.5)
+    
+    # 添加平滑的纹理变化
+    texture_scale = cv2.GaussianBlur(np.random.uniform(0.9, 1.1, (h, w)), (5, 5), 2)
+    noise = cv2.GaussianBlur(np.random.normal(0, 0.1, (h, w)), (3, 3), 1)
+    intensity = intensity * texture_scale + noise * intensity
+    
+    # 添加平滑的热点
+    num_hotspots = np.random.randint(1, 3)  # 减少热点数量
+    for _ in range(num_hotspots):
+        offset = np.random.uniform(-radius*0.2, radius*0.2, 2)  # 减小偏移范围
+        hotspot_dist = np.sqrt((x - (center[0] + offset[0]))**2 + 
+                              (y - (center[1] + offset[1]))**2)
+        hotspot = np.exp(-0.5 * (hotspot_dist / (radius * 0.3))**2) * \
+                 np.random.uniform(0.2, 0.3)
+        intensity += hotspot * (target_region > 0)
+    
+    # 应用最终的平滑
+    intensity = cv2.GaussianBlur(intensity, (3, 3), 0.5)
+    
+    # 裁剪并应用强度
+    intensity = np.clip(intensity, 0, 1)
+    target_values = intensity * scale * background_std + background_mean
+    target_values = np.clip(target_values, 0, 255)
+    
+    # 更新目标区域
+    target[valid_region] = target_values[valid_region]
+    mask[valid_region] = 255
+    
+    return target, mask
 
 def ellipse_gen(h, w, target, scale, background_std, background_mean, axis=None):
     """
-    生成一个高斯分布的椭圆形，并将其绘制到目标图像上。
-    
-    参数:
-    - h: 图像的高度
-    - w: 图像的宽度
-    - target: 目标图像
-    - scale: 缩放因子，用于调整椭圆形的亮度
-    - background_std: 背景标准差，用于生成椭圆形颜色
-    - background_mean: 背景平均值，用于生成椭圆形颜色
-    - axis: 椭圆形的长短轴（可选）
+    生成一个连续的不规则类椭圆形红外目标
     """
     center = (w // 2, h // 2)
-    
     if axis is None:
         axis1 = max(random.randint(h // 4, h // 2), 1)
         axis2 = max(random.randint(w // 4, w // 2), 1)
     else:
         axis1, axis2 = axis
-        
-    for i in range(h):
-        for j in range(w):
-            if ((i - center[0]) ** 2 / (axis1 ** 2) + (j - center[1]) ** 2 / (axis2 ** 2)) <= 1:
-                gaussion_values = np.exp(-(((i - center[0]) ** 2 / (axis1 ** 2)) + ((j - center[1]) ** 2 / (axis2 ** 2)))) * scale
-                target[i, j] = np.clip(gaussion_values * background_std + background_mean, 0, 255)
-                
-    return axis1, axis2
+    
+    mask = np.zeros((h, w), dtype=np.uint8)
+    
+    # 使用矩阵运算
+    y, x = np.ogrid[:h, :w]
+    
+    # 添加平滑的旋转和扭曲
+    angle = np.random.uniform(0, 2*np.pi)
+    x_rot = (x - center[0]) * np.cos(angle) + (y - center[1]) * np.sin(angle)
+    y_rot = -(x - center[0]) * np.sin(angle) + (y - center[1]) * np.cos(angle)
+    
+    # 减小扭曲程度
+    distortion = np.random.uniform(0.85, 1.15, (2,))
+    dist = np.sqrt((x_rot * distortion[0] / axis2)**2 + 
+                   (y_rot * distortion[1] / axis1)**2)
+    
+    # 使用更平滑的边缘扰动
+    theta = np.arctan2(y - center[1], x - center[0])
+    edge_noise = 1 + 0.1 * np.cos(2 * theta) + 0.08 * np.sin(2 * theta)
+    smooth_noise = cv2.GaussianBlur(np.random.normal(0, 0.08, (h, w)), (5, 5), 2)
+    edge_noise += smooth_noise
+    
+    # 创建目标区域并确保连续性
+    target_region = (dist * edge_noise) <= 1
+    kernel = np.ones((3, 3), np.uint8)
+    target_region = cv2.morphologyEx(target_region.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+    target_region = cv2.morphologyEx(target_region, cv2.MORPH_OPEN, kernel)
+    
+    # 计算强度
+    intensity = np.zeros((h, w))
+    valid_region = target_region > 0
+    intensity[valid_region] = np.exp(-0.7 * (dist[valid_region] * 1.5)**1.5)
+    
+    # 添加平滑的纹理和噪声
+    texture = cv2.GaussianBlur(np.random.uniform(0.9, 1.1, (h, w)), (5, 5), 2)
+    noise = cv2.GaussianBlur(np.random.normal(0, 0.08, (h, w)), (3, 3), 1)
+    intensity = intensity * texture + noise * intensity
+    
+    # 添加平滑的热点
+    num_hotspots = np.random.randint(1, 3)
+    for _ in range(num_hotspots):
+        offset = np.random.uniform(-0.2, 0.2, 2)
+        hotspot_dist = np.sqrt(((x - (center[0] + offset[0]*axis2))/axis2)**2 + 
+                              ((y - (center[1] + offset[1]*axis1))/axis1)**2)
+        hotspot = np.exp(-0.5 * (hotspot_dist * 1.5)**2) * \
+                 np.random.uniform(0.2, 0.3)
+        intensity += hotspot * (target_region > 0)
+    
+    # 最终平滑处理
+    intensity = cv2.GaussianBlur(intensity, (3, 3), 0.5)
+    
+    # 裁剪并应用强度
+    intensity = np.clip(intensity, 0, 1)
+    target_values = intensity * scale * background_std + background_mean
+    target_values = np.clip(target_values, 0, 255)
+    
+    # 更新目标区域
+    target[valid_region] = target_values[valid_region]
+    mask[valid_region] = 255
+    
+    return target, mask, axis1, axis2
 
  
 def generate_irregular_polygon_points(num_points):
+    """
+    生成不规则多边形的顶点
+    
+    参数:
+    num_points: 多边形顶点数量
+    返回: 极坐标角度数组
+    """
     # 初始化第一个顶点的极坐标角度
     initial_angle = np.random.uniform(0, 2 * np.pi)
     
@@ -99,227 +219,231 @@ def polygon_gen(h, w, target, pixel_scale, background_std, background_mean, angl
     cv2.fillPoly(target, [points], color)
     
     return angles
-      
-# 初始化参数：中心点、形状（圆形、椭圆、多边形）、大小，像素值
-def target_generator(target, 
-                     shape_type, 
-                     background_std, 
-                     background_mean, 
-                     background_diff, 
-                     target_distance=3000, 
-                     base_distance = 3000, 
-                     params=None):
-   
-    h, w = target.shape
-    # TODO 计算辐射强度折算像素值，待优化
+
+def load_3d_model_library(models_dir):
+    """
+    加载3D模型库
+    
+    参数:
+    models_dir: 模型库目录路径
+    返回: (加载的模型列表, 模型文件路径列表)
+    """
+    models = []
+    model_paths = []
+    
+    # 确保目录存在
+    if not os.path.exists(models_dir):
+        print(f"warning: models library directory not found: {models_dir}")
+        return models, model_paths
+        
+    # 获取所有.obj文件
+    for file in os.listdir(models_dir):
+        if file.endswith('.obj'):
+            model_path = os.path.join(models_dir, file)
+            try:
+                mesh = trimesh.load(model_path, force='mesh')
+                mesh.fix_normals()
+                mesh = normalize_mesh(mesh)
+                models.append(mesh)
+                model_paths.append(model_path)
+                print(f"load 3d model success: {file}")
+            except Exception as e:
+                print(f"load 3d model failed: {file}: {e}")
+    
+    if not models:
+        print("warning: no valid 3d model")
+    else:
+        print(f"load {len(models)} 3d models")
+    
+    return models, model_paths
+
+def add_target_to_background(background, target_mask, target_size_ratio=0.1, peak_temp=250, 
+                           falloff_sigma=2.0, min_temp=220):
+    """
+    将红外目标添加到背景图像块中
+    
+    参数:
+    background: 背景图像块
+    target_mask: 目标掩码
+    target_size_ratio: 目标相对于背景的大小比例
+    peak_temp: 目标峰值温度
+    falloff_sigma: 温度衰减系数
+    min_temp: 最小温度
+    """
+    # 获取背景图像块尺寸
+    bg_h, bg_w = background.shape
+    
+    # 获取目标掩码的轮廓
+    contours, _ = cv2.findContours(target_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("target mask not found contours")
+    
+    # 获取目标的边界框
+    x, y, w, h = cv2.boundingRect(np.concatenate(contours))
+    
+    # 计算目标的期望大小
+    target_size = int(min(bg_w, bg_h) * target_size_ratio)
+    scale = target_size / max(w, h)
+    new_w = max(int(w * scale), 1)
+    new_h = max(int(h * scale), 1)
+    
+    # 确保目标尺寸不超过背景块
+    if new_w > bg_w or new_h > bg_h:
+        scale = min(bg_w/w, bg_h/h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+    
+    # 缩放掩码，保持原始形状
+    target_mask_resized = cv2.resize(target_mask[y:y+h, x:x+w], (new_w, new_h))
+    
+    # 生成红外特征的目标强度
+    target_intensity = generate_ir_target_intensity(
+        target_mask_resized, 
+        peak_temp=peak_temp,
+        falloff_sigma=falloff_sigma,
+        min_temp=min_temp
+    )
+    
+    # 将目标放在背景块中心
+    start_x = (bg_w - new_w) // 2
+    start_y = (bg_h - new_h) // 2
+    
+    # 创建结果图像
+    result = background.copy()
+    
+    # 在目标位置应用强度值
+    mask_region = target_mask_resized > 0
+    result[start_y:start_y+new_h, start_x:start_x+new_w] = \
+        np.where(mask_region, 
+                target_intensity, 
+                result[start_y:start_y+new_h, start_x:start_x+new_w])
+    
+    return result, (start_x, start_y, new_w, new_h), mask_region
+
+def target_generator(target_background, shape_type, background_std, background_mean, background_diff, target_distance, base_distance=3000, params=None, models_library=None):
+    """
+    生成目标和对应的掩码
+    参数:
+    target_background: 背景图像
+    shape_type: 目标形状类型 ('circle', 'ellipse', '3d_projection')
+    background_std: 背景标准差
+    background_mean: 背景均值
+    background_diff: 背景最大最小值差异
+    target_distance: 目标距离
+    base_distance: 基准距离，用于计算辐射强度
+    params: 目标形状参数
+    models_library: 3D模型库
+    """
+    h, w = target_background.shape
+    mask = np.zeros((h, w), dtype=np.uint8)  # 初始化掩码图像
+
+    # 计算辐射强度折算像素值
     eta = np.clip(np.log(np.log(base_distance**2 / target_distance**2 + 1) + 1), 0, 1) 
     scale = background_diff * eta # 基准值原来设计的是scale = 0.5
 
+    if shape_type == '3d_projection':
+        if not models_library or not models_library[0]:
+            print("warning: 3d model library is empty, switch to circle target")
+            shape_type = 'circle'
+            params = None
+    
     # 目标初始化，根据形状类型生成目标
     if shape_type == 'circle':
-        circle_gen(h, w, target, scale, background_std, background_mean)
-        target_info = {'shape_type': 'circle', 'target': target, 'params':["hhh"]}
+        target, mask = circle_gen(h, w, target_background, scale, background_std, background_mean)
+        target_info = {'shape_type': 'circle', 'target': target, 'mask': mask, 'params': None}
 
     elif shape_type == 'ellipse':
-        axis = ellipse_gen(h, w, target, scale, background_std, background_mean, params)
-        target_info = {'shape_type': 'ellipse', 'target': target, 'params':axis}
+        target, mask, axis1, axis2 = ellipse_gen(h, w, target_background, scale, background_std, background_mean, params)
+        target_info = {'shape_type': 'ellipse', 'target': target, 'mask': mask, 'params': (axis1, axis2)}
 
-    elif shape_type == 'polygon':
-        angles = polygon_gen(h, w, target, scale, background_std, background_mean, params)
-        target_info = {'shape_type': 'polygon', 'target': target, 'params':angles}
-
-    return target_info  # 返回目标的形状和相关参数
-
-
-# 根据不同运动模式计算目标位移
-def get_displacement(motion_mode, 
-                     init_velocity, 
-                     max_velocity, 
-                     direction_coef, 
-                     acceleration_factor, 
-                     a0, 
-                     k, 
-                     frame, 
-                     fps, 
-                     random_accelerations):
+    # elif shape_type == 'polygon':
+    #     angles = polygon_gen(h, w, target_background, scale, background_std, background_mean, params)
+    #     target_info = {'shape_type': 'polygon', 'target': target, 'params':angles}
     
-    x_coef, y_coef, z_coef = direction_coef
-    
-    t = 1 / fps
-    
-    if motion_mode == 0:  # 'uniform' 匀速
-        velocity = min(init_velocity, max_velocity)  # 确保速度不超过最大速度
-        displacement = velocity * t  # 位移随时间线性增加
-
-    elif motion_mode == 1:  # 'uniform_acceleration' 匀加速
-        velocity = init_velocity + acceleration_factor * t  # 速度随时间增加
-        velocity = min(velocity, max_velocity)  # 确保速度不超过最大速度
-        displacement = init_velocity * t + 0.5 * acceleration_factor * t**2  # 位移考虑初始速度
-
-    elif motion_mode == 2:  # 'variable_acceleration' 变加速
-        acceleration = a0 + k * t  # 加速度随时间变化
-        velocity = init_velocity + a0 * t + 0.5 * k * t**2  # 速度随时间变化，考虑初始速度
-        velocity = min(velocity, max_velocity)  # 确保速度不超过最大速度
-        displacement = init_velocity * t + 0.5 * a0 * t**2 + (1/6) * k * t**3  # 位移考虑初始速度和变加速
-
-    # elif motion_mode == 3:  # 'random_motion' 随机运动
-    #     time_step = 1 / fps  # 使用帧率作为时间步长
-
-    #     # 初始化速度和位移
-    #     velocity = init_velocity
-    #     displacement = 0
-
-    #     # 获取前frame个加速度变化
-    #     accelerations = random_accelerations[:frame]
+    elif shape_type == '3d_projection':
+        if params is None or 'model_idx' not in params:
+            model_idx = np.random.randint(0, len(models_library[0]))
+            rotation = (0, 0, 0)
+        else:
+            model_idx = params['model_idx']
+            rotation = params['rotation']
         
-    #     # 计算速度
-    #     velocity = np.cumsum(accelerations) * acceleration_factor + velocity
-    #     velocity = np.clip(velocity, 0, max_velocity)  # 确保速度不超过最大速度
-
-    #     # 计算位移
-    #     displacements = np.cumsum(velocity) * time_step * direction_coef
+        mesh = models_library[0][model_idx]
+        target_pos = np.array([0, 0, target_distance]) # TODO: 需要修改目标位置
+        azimuth, elevation, _ = calculate_target_angles(target_pos)
         
-    #     # 获取当前帧的位移
-    #     displacement = displacements[-1] if len(displacements) > 0 else 0
-
-    else:
-        raise ValueError("Invalid motion mode")
-
-    displacement_x = displacement * x_coef
-    displacement_y = displacement * y_coef
-    displacement_z = displacement * z_coef
-    return displacement_x, displacement_y, displacement_z, velocity
-
-# 计算所有目标的累计位移
-def get_cumulative_displacements(motion_modes, 
-                                 time_ratios, 
-                                 total_frames, 
-                                 fps, 
-                                 target_init_velocity, 
-                                 max_velocity, 
-                                 target_direction_coef, 
-                                 target_acceleration_factor, 
-                                 init_acceleration, 
-                                 acceleration_change_rate, 
-                                 target_nums, 
-                                 x_range, 
-                                 y_range, 
-                                 z_range, 
-                                 target_positions, 
-                                 img_w, 
-                                 img_h): 
-    
-    frame_time = 1 / fps
-    all_cumulative_displacements = []
-
-    x_min, x_max = x_range
-    y_min, y_max = y_range
-    z_min, z_max = z_range
-    
-    for target_index in range(target_nums):
-        target_cumulative_displacements = []
-        cumulative_displacement_x = 0
-        cumulative_displacement_y = 0
-        cumulative_displacement_z = 0
-
-        x0, y0, z0 = target_positions[target_index]
-        init_velocity = target_init_velocity[target_index]
-        direction_coef = target_direction_coef[target_index]
-        acceleration_factor = target_acceleration_factor[target_index]
-        a0 = init_acceleration[target_index]
-        k = acceleration_change_rate[target_index]
-
-        target_motion_modes, target_time_ratios = motion_modes[target_index], time_ratios[target_index]
+        # 获取投影掩码
+        print("----------in 3d projection------------")
+        target_mask = get_projection(
+            mesh.copy(),
+            azimuth,
+            elevation,
+            distance=target_distance/200,
+            target_rotation=rotation
+        )
+        print("----------out 3d projection------------")
+        # 使用add_target_to_background函数处理目标
+        target, bbox, mask_region = add_target_to_background(
+            target_background,
+            target_mask,
+            target_size_ratio=1,
+            peak_temp=250,
+            falloff_sigma=2.0,
+            min_temp=220
+        )
+        start_x, start_y, new_w, new_h = bbox
+        # 确保掩码为二值图像
+        mask[start_y:start_y+new_h, start_x:start_x+new_w] = mask_region * 255
         
-        cur_velocity = init_velocity
-        
-        for mode, ratio in zip(target_motion_modes, target_time_ratios):
-            num_frames = int(ratio * total_frames)
-            if mode == 3:
-                random_accelerations = np.random.uniform(-1, 1, num_frames)
-            else:
-                random_accelerations = None
-                
-            for frame in range(num_frames):       
-                displacement_x, displacement_y, displacement_z, cur_velocity = get_displacement(mode, 
-                                                                                                cur_velocity, 
-                                                                                                max_velocity, 
-                                                                                                direction_coef, 
-                                                                                                acceleration_factor, 
-                                                                                                a0, 
-                                                                                                k, 
-                                                                                                frame+1, 
-                                                                                                fps, 
-                                                                                                random_accelerations)
-                
-                cumulative_displacement_x = displacement_x + cumulative_displacement_x
-                cumulative_displacement_y = displacement_y + cumulative_displacement_y
-                cumulative_displacement_z = displacement_z + cumulative_displacement_z
+        target_info = {
+            'shape_type': '3d_projection', 
+            'target': target, 
+            'mask': mask, 
+            'params': {
+                'model_idx': model_idx,
+                'rotation': rotation,
+                'distance': target_distance,
+                'bbox': bbox
+            }
+        }
 
-                # 目标移动边界检查是否超出范围，如果超出则调整方向
-                if cumulative_displacement_x < (x_min-x0) or cumulative_displacement_x > (x_max+img_w-x0):
-                    direction_coef = (-direction_coef[0], direction_coef[1], direction_coef[2])
-                    cumulative_displacement_x = max(min(cumulative_displacement_x, x_max+img_w-x0), x_min-x0)
-                if cumulative_displacement_y < (y_min-y0) or cumulative_displacement_y > (y_max+img_h-y0):
-                    direction_coef = (direction_coef[0], -direction_coef[1], direction_coef[2])
-                    cumulative_displacement_y = max(min(cumulative_displacement_y, y_max+img_h-y0), y_min-y0)
-                if cumulative_displacement_z < (z_min-z0) or cumulative_displacement_z > (z_max-z0):
-                    direction_coef = (direction_coef[0], direction_coef[1], -direction_coef[2])
-                    cumulative_displacement_z = max(min(cumulative_displacement_z, z_max-z0), z_min-z0)
-
-                target_cumulative_displacements.append((cumulative_displacement_x, cumulative_displacement_y, cumulative_displacement_z))
-
-            if len(target_cumulative_displacements) >= total_frames:
-                break
-
-        # 如果生成的帧数少于总帧数，填充剩余帧数
-        while len(target_cumulative_displacements) < total_frames:
-            target_cumulative_displacements.append(target_cumulative_displacements[-1])
-
-        all_cumulative_displacements.append(target_cumulative_displacements[:total_frames])
-
-    return np.array(all_cumulative_displacements)
-
-def get_cumulative_spin():
-    return 
-
-def get_spin_info(angle):
-    w, h = target.shape[0], target.shape[1]
-    # 2D仿射变换
-    M_rotate = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1)
-    target = cv2.warpAffine(target, M_rotate, (w, h))
-    # TODO 3D建模+旋转+投影
-    return target
-
-  
-def new_target_gen():
-    # 新动态目标生成
-    return 
-
-def handle_critical_target():
-    # 处理目标消失情况
-    # 1.删除目标
-    # 2.更改目标运动方向
-    # 3.重新初始化目标位置
-    return 
+    return target_info
 
 
-def MISTG(input_images, max_num_targets):
-    
+def MISTG(input_images, max_num_targets, output_folder):
     """
-    Moving Infrared Small Target Generate and Background Alignment.
+    Moving Infrared Small Target Generate and Background Alignment
+    运动红外弱小目标生成与背景对齐
+    
+    主要步骤:
+    1. 背景位移计算 - 使用光流法计算背景运动
+    2. 参数初始化 - 设置相机参数、目标参数等
+    3. 第一帧目标初始化 - 生成初始目标
+    4. 目标更新 - 根据运动模型更新后续帧的目标
+    
+    参数:
+    input_images: 输入背景图像序列
+    max_num_targets: 最大目标数量
+    output_folder: 输出文件夹路径
     """
     
+    # 初始化参数
     init_target_nums = max_num_targets
     img_nums, img_h, img_w = input_images.shape
     print("Image Number: ", img_nums)                    # 512 640
     print("Image Size: ", [img_h, img_w])                    # 512 640
     
-    annotations = []            # 标签
     output_images = input_images.copy()
+    output_images_mask = np.zeros_like(input_images)
 
 
     ###########################################  background displacement  ##########################################
+    """
+    背景位移计算部分:
+    1. 使用Lucas-Kanade光流法计算连续帧之间的背景运动
+    2. 累积计算总位移,用于后续目标位置更新
+    """
+    
     # Track previous features for optical flow calculation
     # Lucas-Kanade光流法参数
     lk_params = dict(
@@ -398,8 +522,8 @@ def MISTG(input_images, max_num_targets):
     
     min_target_size = 1                                                  # 初始化目标尺寸最小值 m
     max_target_size = 5                                                  # 初始化目标尺寸最大值 m
-    min_init_distance = 2000                                             # 最小目标初始化距离 m
-    max_init_distance = 5000                                             # 最大目标初始化距离 m   
+    min_init_distance = 500                                             # 最小目标初始化距离 m
+    max_init_distance = 1000                                             # 最大目标初始化距离 m   
     z_range_min = 500                                                     # 目标最近距离，超出距离调转方向
     z_range_max = 6500                                                   # 目标最远距离，超出距离调转方向                      
     
@@ -426,6 +550,8 @@ def MISTG(input_images, max_num_targets):
     init_target_nums = int(target_density * (x_range * y_range))
     print("Panoramic Target Number: ", init_target_nums)
     
+    models_dir = "/home/guantp/Infrared/MIRST/motive_target_gen/3d_models/"
+    
     # 全场景图像坐标范围，以第一帧图像左下角为坐标原点
     x_min = np.ceil(x_displacement_range_min + margin)
     y_min = np.ceil(y_displacement_range_min  + margin)
@@ -443,14 +569,36 @@ def MISTG(input_images, max_num_targets):
 
     pixel_scale = (target_distances * pixel_size) / F          # 1px distance, 50mm: 5000->1.5m 3000->0.9m
     target_pixel = np.round(target_real_size / pixel_scale)    # 目标占据像素
-    # print(target_pixel)
+    print(target_pixel)
     ####################################################################################################
     
     
     
-    ##################################  first frame target init  ######################################    
-    target_shapes = ['circle', 'ellipse', 'polygon']                                        
-    target_shape_ids = np.random.randint(0, len(target_shapes), size=init_target_nums)        # 初始化目标形状
+    ##################################  first frame target init  ###################################### 
+    # 加载3D模型库
+    models_library = load_3d_model_library(models_dir)
+    
+    target_shapes = ['circle', 'ellipse']
+    # if models_library[0]:  # 如果成功加载了模型
+    #     target_shapes.append('3d_projection')   
+    # 记录每个目标的类型
+    target_shape_ids = {}
+    target_params = {}
+    
+    for j in range(init_target_nums):
+        # target_shape_ids[j] = np.random.choice(target_shapes, p=[0.2, 0.1, 0.7])
+        target_shape_ids[j] = np.random.choice(target_shapes, p=[0.5, 0.5])
+        if target_shape_ids[j] == '3d_projection':
+            target_params[j] = {
+                'model_idx': np.random.randint(0, len(models_library[0]))
+            }
+        else:
+            target_params[j] = None  
+              
+    # 只为3D投影目标生成旋转序列
+    all_rotations = generate_3d_targets_rotation_sequences(img_nums, fps, target_shape_ids)
+                    
+    # target_shape_ids = np.random.randint(0, len(target_shapes), size=init_target_nums)        # 初始化目标形状
     init_targets_info = []
     # First frame: Initialize targets
     # Calculate background brightness statistics
@@ -458,35 +606,67 @@ def MISTG(input_images, max_num_targets):
     background_mean = np.mean(first_frame_img)
     background_std = np.std(first_frame_img)
     background_diff = (np.max(first_frame_img) - np.min(first_frame_img)) / background_std  
-    
+    print("######## The 1 frame ########")
     for j in range(init_target_nums):
-        shape_type = target_shapes[target_shape_ids[j]]
+
+        shape_type = target_shape_ids[j]
         h = w = int(target_pixel[j]) # TODO 待优化
         x, y, z = target_positions[j]
- 
-        img_target_background = input_images[0, y:y+h, x:x+w]
-        
-        init_target_info = target_generator(img_target_background, 
-                                            shape_type, 
-                                            background_std, 
-                                            background_mean, 
-                                            background_diff, 
-                                            z, 
-                                            base_distance=base_distance)
-        
-        target = init_target_info['target']       
-        init_targets_info.append(init_target_info)
-          
-        if 0 <= x < img_w and 0 <= y < img_h:
+
+        if (0+w) <= x < (img_w-w) and (0+h) <= y < (img_h-h):
+            img_target_background = input_images[0][y:y+h, x:x+w]
+            
+            print(f"target {j}: y, x: {y}, {x}, h, w: {h}, {w}", shape_type)
+            # print(img_target_background.shape)
+            
+            init_target_info = target_generator(
+                img_target_background, 
+                shape_type, 
+                background_std, 
+                background_mean, 
+                background_diff, 
+                z,
+                base_distance=base_distance,
+                params=None,
+                models_library=models_library
+            )
+            
+            target = init_target_info['target']       
+            mask = init_target_info['mask']
+            init_targets_info.append(init_target_info)
+            
             # Generate targets and add them to the frame
             output_images[0, y:y+h, x:x+w] = target
-        
+            output_images_mask[0, y:y+h, x:x+w] = mask
+            
+        else: # TODO 待优化
+            init_target_info = target_info = {
+            'shape_type': shape_type, 
+            'target': np.array([]), 
+            'mask': np.array([]),
+            'params': None
+        }
+            init_targets_info.append(init_target_info)        
+    
+
+    # 保存当前帧图像
+    output_image_path = os.path.join(output_folder, f"output_image_0.png")
+    cv2.imwrite(output_image_path, output_images[0])
+    # 保存掩码图像
+    mask_output_path = os.path.join(output_folder, f"output_image_0_mask.png")
+    cv2.imwrite(mask_output_path, output_images_mask[0])        
     #####################################################################################################
     
 
     ##########################################  target update  ##########################################  
-
-    # 随机初始化运动速度参数
+    """
+    目标更新部分:
+    1. 初始化目标运动参数(速度、加速度、运动方向等)
+    2. 计算目标在整个序列中的累积位移
+    3. 根据背景位移和目标运动更新每一帧的目标位置和外观
+    """
+    
+    # 随机初始化运动参数
     targets_init_velocity = np.random.randint(min_init_velocity, 
                                               max_init_velocity, 
                                               size=init_target_nums)
@@ -510,32 +690,49 @@ def MISTG(input_images, max_num_targets):
     motion_direction_coef = generate_multiple_sets_of_random_numbers(init_target_nums, 3)
     targets_direction_coef = motion_direction * motion_direction_coef
 
-    # 计算出后续全部帧所有目标与第一帧的位移、旋转变化
-    targets_cumulative_displacements = get_cumulative_displacements(motion_modes, 
-                                                                    time_ratios, 
-                                                                    img_nums-1, 
-                                                                    fps, 
-                                                                    targets_init_velocity, 
-                                                                    max_velocity, 
-                                                                    targets_direction_coef, 
-                                                                    targets_acceleration_factor, 
-                                                                    targets_init_acceleration, 
-                                                                    targets_acceleration_change_rate, 
-                                                                    init_target_nums, 
-                                                                    [x_displacement_range_min, x_displacement_range_max], 
-                                                                    [y_displacement_range_min, y_displacement_range_max], 
-                                                                    [z_range_min, z_range_max], 
-                                                                    target_positions, 
-                                                                    img_w, 
-                                                                    img_h) # return shape:[targets_num, img_num, 3]
+    # 计算目标累积位移
+    targets_cumulative_displacements = get_cumulative_displacements(
+        motion_modes, 
+        time_ratios,
+        img_nums-1,
+        fps,
+        targets_init_velocity,
+        max_velocity,
+        targets_direction_coef,
+        targets_acceleration_factor,
+        targets_init_acceleration,
+        targets_acceleration_change_rate,
+        init_target_nums,
+        [x_displacement_range_min, x_displacement_range_max],
+        [y_displacement_range_min, y_displacement_range_max],
+        [z_range_min, z_range_max],
+        target_positions,
+        img_w,
+        img_h
+    )  # 返回形状: [targets_num, img_num, 3]
+        
+    if target_shape_ids[j] == '3d_projection':
+        params = target_params[j].copy()  # 复制基础参数
+        params['rotation'] = tuple(all_rotations[j][i])  # 添加当前帧的旋转参数
+    else:
+        params = None
     
-    # print(targets_cumulative_displacements)
-
-    targets_cumulative_spin = get_cumulative_spin() # TODO
+    target_info = target_generator(
+        img_target_background, 
+        target_shape_ids[j],  # 使用记录的目标类型
+        background_std, 
+        background_mean, 
+        background_diff, 
+        z,
+        base_distance=base_distance,
+        params=params,
+        models_library=models_library
+    )
  
       
     # 以第一帧的左下角作为整个场景的坐标原点（0,0），目标动态更新与计算，目标更新依据背景位移多少进行更新    
     for i in range(1, img_nums):
+        print("######## The ", i+1, " frame ########")
         current_frame = input_images[i]
         current_gray = current_frame.astype(np.uint8)
                 
@@ -555,7 +752,7 @@ def MISTG(input_images, max_num_targets):
         # 更新像素值
         # 输入参数：初始帧参数，位移变化、旋转变化
         for j in range(init_target_nums):
-            shape_type = target_shapes[target_shape_ids[j]]
+            shape_type = target_shape_ids[j]
             h = w = int(update_target_pixel[j]) # TODO 待优化
             x, y, z = update_target_positions[j]
 
@@ -564,8 +761,9 @@ def MISTG(input_images, max_num_targets):
             
             # 判断目标是否显示在图像中，只需要计算在现在这一帧图像内的目标，依据目标中心点和目标大小判定
             # 简化：忽略目标大小，仅依据中心点判定
-            if 0 <= x < img_w and 0 <= y < img_h:
+            if (0+w) <= x < (img_w-w) and (0+h) <= y < (img_h-h):
                 img_target_background = current_gray[y:y+h, x:x+w]
+                print(f"target {j}: y, x: {y}, {x}, h, w: {h}, {w}", shape_type)
                 
                 target_info = target_generator(img_target_background, 
                                                shape_type, 
@@ -574,28 +772,50 @@ def MISTG(input_images, max_num_targets):
                                                background_diff, 
                                                z, 
                                                base_distance=base_distance, 
-                                               params=init_targets_info[j]['params'])
+                                               params=init_targets_info[j]['params'],
+                                               models_library=models_library)
                 
                 target = target_info['target']
+                mask = target_info['mask']
                 # Generate targets and add them to the frame
                 output_images[i, y:y+h, x:x+w] = target 
-            
-    return output_images, annotations
+                output_images_mask[i, y:y+h, x:x+w] = mask
+                if shape_type == '3d_projection':
+                    params = target_info['params']
+                    current_rotation = params['rotation']
+                    new_rotation = update_rotation(current_rotation, i, fps, params)
+                    params['rotation'] = new_rotation
+                    # 更新目标信息
+                    target_info['params'] = params
+                    
+        
+        # 保存当前帧图像
+        output_image_path = os.path.join(output_folder, f"output_image_{i}.png")
+        cv2.imwrite(output_image_path, output_images[i])
+        # 保存掩码图像
+        mask_output_path = os.path.join(output_folder, f"output_image_{i}_mask.png")
+        cv2.imwrite(mask_output_path, output_images_mask[i])   
+    return output_images
     ######################################################################################################
 
 
 if __name__ == '__main__':
     # 参数配置
-    # folder_path = "/home/guantp/Infrared/datasets/mydata/250110/M615/100_1min_4"   # Replace with your folder containing images
-    # folder_path = "/home/guantp/Infrared/MIRST/motive_target_gen/data4"
-    folder_path = "/home/guantp/Infrared/datasets/复杂背景下红外弱小运动目标检测数据集/train/100/"
-    output_folder = "/home/guantp/Infrared/MIRST/motive_target_gen/imgs/"
-    max_num_targets = 20
+    folder_path = "/home/guantp/Infrared/datasets/mydata/250110/M615/100_1min_4"   # Replace with your folder containing images
+    # folder_path = "/home/guantp/Infrared/MIRST/motive_target_gen/bg_imgs"
+    # folder_path = "/home/guantp/Infrared/datasets/复杂背景下红外弱小运动目标检测数据集/train/100/"
+    output_folder = "/home/guantp/Infrared/MIRST/motive_target_gen/motive_target_imgs/"
+
+    # 如果输出文件夹存在，则删除整个文件夹
+    if os.path.exists(output_folder):
+        shutil.rmtree(output_folder)
+    # 重新创建文件夹
+    os.makedirs(output_folder, exist_ok=True)
     
+    max_num_targets = 20
+
     input_images = load_images_from_folder(folder_path)
-    output_images, annotations = MISTG(input_images, max_num_targets)
-    annotations = ["Annotation " + str(i) for i in range(input_images.shape[0])]
-    save_images_and_annotations(output_folder, output_images, annotations)
+    output_images = MISTG(input_images, max_num_targets, output_folder)
     print("Moving Infrared Small Target Generate Finish.")
     
 # TODO 未完成部分以及优化
