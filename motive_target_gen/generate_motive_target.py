@@ -24,7 +24,7 @@ from utils import (
     load_images_from_folder
 )
 
-def circle_gen(h, w, target, scale, background_std, background_mean): #TODO 待优化
+def circle_gen(h, w, target, scale, background_std, background_mean, params):
     """
     生成一个连续的不规则类圆形红外目标
     参数:
@@ -33,63 +33,121 @@ def circle_gen(h, w, target, scale, background_std, background_mean): #TODO 待�
     scale: 目标强度缩放因子
     background_std: 背景标准差
     background_mean: 背景均值
-    """
-    center = (w // 2, h // 2)
-    radius = max(min(h, w) // 4, 1)
-    mask = np.zeros((h, w), dtype=np.uint8)
+    radius: 目标半径，如果为None则自动计算
+    irregularity: 形状不规则参数字典
+    noise_params: 噪声参数字典
     
-    # 使用矩阵运算
+    返回:
+    (target, mask, params): 处理后的图像、掩码和使用的参数
+    """
+    
+    if params:
+        radius=params['radius']
+        irregularity=params['irregularity']
+        noise_params=params['noise_params']
+    else:
+        radius=None
+        irregularity=None 
+        noise_params=None
+        
+    center = (w // 2, h // 2)
+    if radius is None:
+        radius = max(min(h, w) // 4, 1)
+    
+    # 初始化或使用传入的不规则参数
+    if irregularity is None:
+        irregularity = {
+            'angle': np.random.uniform(0, 2*np.pi),
+            'distortion': np.random.uniform(0.7, 1.3, (2,)),  # 增大扭曲范围
+            'edge_freq': np.random.uniform(2.5, 3.5),  # 增加边缘扰动频率
+            'edge_amplitude': np.random.uniform(0.15, 0.25)  # 增加边缘扰动幅度
+        }
+    else:
+        # 对现有参数进行微小随机调整
+        irregularity = {
+            'angle': irregularity['angle'] + np.random.uniform(-0.1, 0.1),
+            'distortion': irregularity['distortion'] * np.random.uniform(0.98, 1.02, (2,)),
+            'edge_freq': irregularity['edge_freq'] + np.random.uniform(-0.05, 0.05),
+            'edge_amplitude': irregularity['edge_amplitude'] * np.random.uniform(0.95, 1.05)
+        }
+
+    # 初始化或使用传入的噪声参数
+    if noise_params is None:
+        noise_params = {
+            'texture_scale': np.random.uniform(0.9, 1.1),
+            'noise_strength': np.random.uniform(0.08, 0.12),
+            'hotspot_intensity': np.random.uniform(0.2, 0.3),
+            'hotspot_count': np.random.randint(1, 3),
+            'hotspot_size': np.random.uniform(0.25, 0.35)
+        }
+    else:
+        # 对现有参数进行微小随机调整
+        noise_params = {
+            'texture_scale': noise_params['texture_scale'] * np.random.uniform(0.98, 1.02),
+            'noise_strength': noise_params['noise_strength'] * np.random.uniform(0.95, 1.05),
+            'hotspot_intensity': noise_params['hotspot_intensity'] * np.random.uniform(0.98, 1.02),
+            'hotspot_count': noise_params['hotspot_count'],
+            'hotspot_size': noise_params['hotspot_size'] * np.random.uniform(0.98, 1.02)
+        }
+
+    mask = np.zeros((h, w), dtype=np.uint8)
     y, x = np.ogrid[:h, :w]
     
-    # 添加形状扭曲，但减小扭曲程度
-    angle = np.random.uniform(0, 2*np.pi)
-    distortion = np.random.uniform(0.85, 1.15, (2,))  # 减小扭曲范围
+    # 使用参数化的形状扭曲
+    angle = irregularity['angle']
+    distortion = irregularity['distortion']
     
     # 坐标变换
     x_rot = (x - center[0]) * np.cos(angle) + (y - center[1]) * np.sin(angle)
     y_rot = -(x - center[0]) * np.sin(angle) + (y - center[1]) * np.cos(angle)
     dist_from_center = np.sqrt((x_rot * distortion[0])**2 + (y_rot * distortion[1])**2)
     
-    # 使用更平滑的边缘扰动
+    # 使用参数化的边缘扰动
     theta = np.arctan2(y - center[1], x - center[0])
-    # 减少高频扰动，使用更低频率的变化
-    edge_noise = 1 + 0.15 * np.cos(2 * theta) + 0.1 * np.sin(2 * theta)
-    # 添加平滑的随机扰动
-    smooth_noise = cv2.GaussianBlur(np.random.normal(0, 0.1, (h, w)), (5, 5), 2)
+    edge_noise = 1 + irregularity['edge_amplitude'] * (
+        np.cos(irregularity['edge_freq'] * theta) + 
+        np.sin(irregularity['edge_freq'] * theta)
+    )
+    smooth_noise = cv2.GaussianBlur(
+        np.random.normal(0, noise_params['noise_strength'], (h, w)), (5, 5), 2
+    )
     edge_noise += smooth_noise
     
-    # 创建基础目标区域
+    # 添加额外的高频扰动
+    high_freq_noise = 0.1 * np.sin(6 * theta) + 0.08 * np.cos(8 * theta)
+    edge_noise += high_freq_noise
+    
+    # 创建目标区域
     target_region = (dist_from_center * edge_noise) <= radius
     
-    # 使用形态学操作确保连续性
+    # 形态学操作
     kernel = np.ones((3, 3), np.uint8)
     target_region = cv2.morphologyEx(target_region.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
     target_region = cv2.morphologyEx(target_region, cv2.MORPH_OPEN, kernel)
     
-    # 使用改进的强度计算方式
+    # 强度计算
     intensity = np.zeros((h, w))
     valid_region = target_region > 0
     intensity[valid_region] = np.exp(-0.7 * (dist_from_center[valid_region] / radius)**1.5)
     
-    # 添加平滑的纹理变化
-    texture_scale = cv2.GaussianBlur(np.random.uniform(0.9, 1.1, (h, w)), (5, 5), 2)
-    noise = cv2.GaussianBlur(np.random.normal(0, 0.1, (h, w)), (3, 3), 1)
+    # 添加参数化的纹理
+    texture_scale = cv2.GaussianBlur(
+        np.ones((h, w)) * noise_params['texture_scale'], (5, 5), 2
+    )
+    noise = cv2.GaussianBlur(
+        np.random.normal(0, noise_params['noise_strength'], (h, w)), (3, 3), 1
+    )
     intensity = intensity * texture_scale + noise * intensity
     
-    # 添加平滑的热点
-    num_hotspots = np.random.randint(1, 3)  # 减少热点数量
-    for _ in range(num_hotspots):
-        offset = np.random.uniform(-radius*0.2, radius*0.2, 2)  # 减小偏移范围
-        hotspot_dist = np.sqrt((x - (center[0] + offset[0]))**2 + 
-                              (y - (center[1] + offset[1]))**2)
-        hotspot = np.exp(-0.5 * (hotspot_dist / (radius * 0.3))**2) * \
-                 np.random.uniform(0.2, 0.3)
+    # 添加参数化的热点
+    for _ in range(noise_params['hotspot_count']):
+        offset = np.random.uniform(-radius*0.2, radius*0.2, 2)
+        hotspot_dist = np.sqrt((x - (center[0] + offset[0]))**2 + (y - (center[1] + offset[1]))**2)
+        hotspot = np.exp(-0.5 * (hotspot_dist / (radius * noise_params['hotspot_size']))**2) * noise_params['hotspot_intensity']
         intensity += hotspot * (target_region > 0)
     
-    # 应用最终的平滑
+    # 最终处理
     intensity = cv2.GaussianBlur(intensity, (3, 3), 0.5)
-    
-    # 裁剪并应用强度
     intensity = np.clip(intensity, 0, 1)
     target_values = intensity * scale * background_std + background_mean
     target_values = np.clip(target_values, 0, 255)
@@ -98,41 +156,123 @@ def circle_gen(h, w, target, scale, background_std, background_mean): #TODO 待�
     target[valid_region] = target_values[valid_region]
     mask[valid_region] = 255
     
-    return target, mask
+    # 返回使用的参数，便于下一帧使用
+    used_params = {
+        'radius': radius,
+        'irregularity': irregularity,
+        'noise_params': noise_params
+    }
+    
+    return target, mask, used_params
 
-def ellipse_gen(h, w, target, scale, background_std, background_mean, axis=None):
+def ellipse_gen(h, w, target, scale, background_std, background_mean, params):
     """
     生成一个连续的不规则类椭圆形红外目标
+    参数:
+    h, w: 目标区域高度和宽度
+    target: 背景图像
+    scale: 目标强度缩放因子
+    background_std: 背景标准差
+    background_mean: 背景均值
+    major_axis: 椭圆长轴
+    minor_axis: 椭圆短轴
+    rotation: 旋转角度（弧度）
+    irregularity: 形状不规则参数字典
+    noise_params: 噪声参数字典
+    
+    返回:
+    (target, mask, used_params): 处理后的图像、掩码和使用的参数
     """
-    center = (w // 2, h // 2)
-    if axis is None:
-        axis1 = max(random.randint(h // 4, h // 2), 1)
-        axis2 = max(random.randint(w // 4, w // 2), 1)
+    
+    if params:
+        major_axis=params['major_axis']
+        minor_axis=params['minor_axis']
+        rotation=params['rotation']
+        irregularity=params['irregularity']
+        noise_params=params['noise_params']
     else:
-        axis1, axis2 = axis
+        major_axis=None
+        minor_axis=None
+        rotation=None
+        irregularity=None
+        noise_params=None
     
+    center = (w // 2, h // 2)
+    
+    # 初始化或使用传入的轴参数
+    if major_axis is None or minor_axis is None:
+        major_axis = max(random.randint(h // 4, h // 2), 1)
+        minor_axis = max(random.randint(w // 4, w // 2), 1)
+    
+    # 初始化或使用传入的旋转角度
+    if rotation is None:
+        rotation = np.random.uniform(0, 2*np.pi)
+    else:
+        # 添加微小的角度变化
+        rotation += np.random.uniform(-0.05, 0.05)
+    
+    # 初始化或使用传入的不规则参数
+    if irregularity is None:
+        irregularity = {
+            'distortion': np.random.uniform(0.7, 1.3, (2,)),
+            'edge_freq': np.random.uniform(2.5, 3.5),
+            'edge_amplitude': np.random.uniform(0.15, 0.25)
+        }
+    else:
+        # 对现有参数进行微小随机调整
+        irregularity = {
+            'distortion': irregularity['distortion'] * np.random.uniform(0.98, 1.02, (2,)),
+            'edge_freq': irregularity['edge_freq'] + np.random.uniform(-0.05, 0.05),
+            'edge_amplitude': irregularity['edge_amplitude'] * np.random.uniform(0.95, 1.05)
+        }
+    
+    # 初始化或使用传入的噪声参数
+    if noise_params is None:
+        noise_params = {
+            'texture_scale': np.random.uniform(0.9, 1.1),
+            'noise_strength': np.random.uniform(0.06, 0.1),
+            'hotspot_intensity': np.random.uniform(0.2, 0.3),
+            'hotspot_count': np.random.randint(1, 3),
+            'hotspot_size': np.random.uniform(0.25, 0.35)
+        }
+    else:
+        # 对现有参数进行微小随机调整
+        noise_params = {
+            'texture_scale': noise_params['texture_scale'] * np.random.uniform(0.98, 1.02),
+            'noise_strength': noise_params['noise_strength'] * np.random.uniform(0.95, 1.05),
+            'hotspot_intensity': noise_params['hotspot_intensity'] * np.random.uniform(0.98, 1.02),
+            'hotspot_count': noise_params['hotspot_count'],
+            'hotspot_size': noise_params['hotspot_size'] * np.random.uniform(0.98, 1.02)
+        }
+
     mask = np.zeros((h, w), dtype=np.uint8)
-    
-    # 使用矩阵运算
     y, x = np.ogrid[:h, :w]
     
-    # 添加平滑的旋转和扭曲
-    angle = np.random.uniform(0, 2*np.pi)
-    x_rot = (x - center[0]) * np.cos(angle) + (y - center[1]) * np.sin(angle)
-    y_rot = -(x - center[0]) * np.sin(angle) + (y - center[1]) * np.cos(angle)
+    # 坐标变换
+    x_rot = (x - center[0]) * np.cos(rotation) + (y - center[1]) * np.sin(rotation)
+    y_rot = -(x - center[0]) * np.sin(rotation) + (y - center[1]) * np.cos(rotation)
     
-    # 减小扭曲程度
-    distortion = np.random.uniform(0.85, 1.15, (2,))
-    dist = np.sqrt((x_rot * distortion[0] / axis2)**2 + 
-                   (y_rot * distortion[1] / axis1)**2)
+    # 使用参数化的扭曲
+    distortion = irregularity['distortion']
+    dist = np.sqrt((x_rot * distortion[0] / minor_axis)**2 + 
+                   (y_rot * distortion[1] / major_axis)**2)
     
-    # 使用更平滑的边缘扰动
+    # 使用参数化的边缘扰动
     theta = np.arctan2(y - center[1], x - center[0])
-    edge_noise = 1 + 0.1 * np.cos(2 * theta) + 0.08 * np.sin(2 * theta)
-    smooth_noise = cv2.GaussianBlur(np.random.normal(0, 0.08, (h, w)), (5, 5), 2)
+    edge_noise = 1 + irregularity['edge_amplitude'] * (
+        np.cos(irregularity['edge_freq'] * theta) + 
+        np.sin(irregularity['edge_freq'] * theta)
+    )
+    smooth_noise = cv2.GaussianBlur(
+        np.random.normal(0, noise_params['noise_strength'], (h, w)), (5, 5), 2
+    )
     edge_noise += smooth_noise
     
-    # 创建目标区域并确保连续性
+    # 添加不规则变形
+    additional_distortion = 0.15 * np.sin(5 * theta) + 0.12 * np.cos(7 * theta)
+    edge_noise += additional_distortion
+    
+    # 创建目标区域
     target_region = (dist * edge_noise) <= 1
     kernel = np.ones((3, 3), np.uint8)
     target_region = cv2.morphologyEx(target_region.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
@@ -141,27 +281,29 @@ def ellipse_gen(h, w, target, scale, background_std, background_mean, axis=None)
     # 计算强度
     intensity = np.zeros((h, w))
     valid_region = target_region > 0
-    intensity[valid_region] = np.exp(-0.7 * (dist[valid_region] * 1.5)**1.5)
+    intensity[valid_region] = np.exp(-0.5 * (dist[valid_region] * 1.5)**1.5)
     
-    # 添加平滑的纹理和噪声
-    texture = cv2.GaussianBlur(np.random.uniform(0.9, 1.1, (h, w)), (5, 5), 2)
-    noise = cv2.GaussianBlur(np.random.normal(0, 0.08, (h, w)), (3, 3), 1)
+    # 添加参数化的纹理和噪声
+    texture = cv2.GaussianBlur(
+        np.ones((h, w)) * noise_params['texture_scale'], (5, 5), 2
+    )
+    noise = cv2.GaussianBlur(
+        np.random.normal(0, noise_params['noise_strength'], (h, w)), (3, 3), 1
+    )
     intensity = intensity * texture + noise * intensity
     
-    # 添加平滑的热点
-    num_hotspots = np.random.randint(1, 3)
-    for _ in range(num_hotspots):
+    # 添加参数化的热点
+    for _ in range(noise_params['hotspot_count']):
         offset = np.random.uniform(-0.2, 0.2, 2)
-        hotspot_dist = np.sqrt(((x - (center[0] + offset[0]*axis2))/axis2)**2 + 
-                              ((y - (center[1] + offset[1]*axis1))/axis1)**2)
-        hotspot = np.exp(-0.5 * (hotspot_dist * 1.5)**2) * \
-                 np.random.uniform(0.2, 0.3)
+        hotspot_dist = np.sqrt(
+            ((x - (center[0] + offset[0]*minor_axis))/minor_axis)**2 + 
+            ((y - (center[1] + offset[1]*major_axis))/major_axis)**2
+        )
+        hotspot = np.exp(-0.5 * (hotspot_dist / noise_params['hotspot_size'])**2) * noise_params['hotspot_intensity']
         intensity += hotspot * (target_region > 0)
     
-    # 最终平滑处理
+    # 最终处理
     intensity = cv2.GaussianBlur(intensity, (3, 3), 0.5)
-    
-    # 裁剪并应用强度
     intensity = np.clip(intensity, 0, 1)
     target_values = intensity * scale * background_std + background_mean
     target_values = np.clip(target_values, 0, 255)
@@ -170,7 +312,16 @@ def ellipse_gen(h, w, target, scale, background_std, background_mean, axis=None)
     target[valid_region] = target_values[valid_region]
     mask[valid_region] = 255
     
-    return target, mask, axis1, axis2
+    # 返回使用的参数，便于下一帧使用
+    used_params = {
+        'major_axis': major_axis,
+        'minor_axis': minor_axis,
+        'rotation': rotation,
+        'irregularity': irregularity,
+        'noise_params': noise_params
+    }
+    
+    return target, mask, used_params
 
  
 def generate_irregular_polygon_points(num_points):
@@ -335,11 +486,11 @@ def target_generator(target_background, shape_type, background_std, background_m
     models_library: 3D模型库
     """
     h, w = target_background.shape
-    mask = np.zeros((h, w), dtype=np.uint8)  # 初始化掩码图像
 
     # 计算辐射强度折算像素值
-    eta = np.clip(np.log(np.log(base_distance**2 / target_distance**2 + 1) + 1), 0, 1) 
+    eta = np.clip(np.log(np.log((base_distance / target_distance)**2 + 1) + 1), 0, 1) 
     scale = background_diff * eta # 基准值原来设计的是scale = 0.5
+    print("target_distance: ", target_distance, "scale: ", scale, "eta: ", eta)
 
     if shape_type == '3d_projection':
         if not models_library or not models_library[0]:
@@ -349,18 +500,19 @@ def target_generator(target_background, shape_type, background_std, background_m
     
     # 目标初始化，根据形状类型生成目标
     if shape_type == 'circle':
-        target, mask = circle_gen(h, w, target_background, scale, background_std, background_mean)
-        target_info = {'shape_type': 'circle', 'target': target, 'mask': mask, 'params': None}
+        target, mask, params = circle_gen(h, w, target_background, scale, background_std, background_mean, params)
+        target_info = {'shape_type': 'circle', 'target': target, 'mask': mask, 'params': params}
 
     elif shape_type == 'ellipse':
-        target, mask, axis1, axis2 = ellipse_gen(h, w, target_background, scale, background_std, background_mean, params)
-        target_info = {'shape_type': 'ellipse', 'target': target, 'mask': mask, 'params': (axis1, axis2)}
+        target, mask, params = ellipse_gen(h, w, target_background, scale, background_std, background_mean, params)
+        target_info = {'shape_type': 'ellipse', 'target': target, 'mask': mask, 'params': params}
 
     # elif shape_type == 'polygon':
     #     angles = polygon_gen(h, w, target_background, scale, background_std, background_mean, params)
     #     target_info = {'shape_type': 'polygon', 'target': target, 'params':angles}
     
     elif shape_type == '3d_projection':
+        mask = np.zeros((h, w), dtype=np.uint8)
         if params is None or 'model_idx' not in params:
             model_idx = np.random.randint(0, len(models_library[0]))
             rotation = (0, 0, 0)
@@ -522,8 +674,8 @@ def MISTG(input_images, max_num_targets, output_folder):
     
     min_target_size = 1                                                  # 初始化目标尺寸最小值 m
     max_target_size = 5                                                  # 初始化目标尺寸最大值 m
-    min_init_distance = 500                                             # 最小目标初始化距离 m
-    max_init_distance = 1000                                             # 最大目标初始化距离 m   
+    min_init_distance = 2000                                             # 最小目标初始化距离 m
+    max_init_distance = 5000                                             # 最大目标初始化距离 m   
     z_range_min = 500                                                     # 目标最近距离，超出距离调转方向
     z_range_max = 6500                                                   # 目标最远距离，超出距离调转方向                      
     
@@ -607,14 +759,15 @@ def MISTG(input_images, max_num_targets, output_folder):
     background_std = np.std(first_frame_img)
     background_diff = (np.max(first_frame_img) - np.min(first_frame_img)) / background_std  
     print("######## The 1 frame ########")
+    frist_target_background = input_images[0]
     for j in range(init_target_nums):
-
+        
         shape_type = target_shape_ids[j]
         h = w = int(target_pixel[j]) # TODO 待优化
         x, y, z = target_positions[j]
 
         if (0+w) <= x < (img_w-w) and (0+h) <= y < (img_h-h):
-            img_target_background = input_images[0][y:y+h, x:x+w]
+            img_target_background = frist_target_background[y:y+h, x:x+w]
             
             print(f"target {j}: y, x: {y}, {x}, h, w: {h}, {w}", shape_type)
             # print(img_target_background.shape)
@@ -637,23 +790,28 @@ def MISTG(input_images, max_num_targets, output_folder):
             
             # Generate targets and add them to the frame
             output_images[0, y:y+h, x:x+w] = target
-            output_images_mask[0, y:y+h, x:x+w] = mask
+            output_images_mask[0, y:y+h, x:x+w][mask > 0] = mask[mask > 0]
+            frist_target_background = output_images[0]
             
         else: # TODO 待优化
-            init_target_info = target_info = {
+            init_target_info = {
             'shape_type': shape_type, 
             'target': np.array([]), 
             'mask': np.array([]),
             'params': None
-        }
+            }
             init_targets_info.append(init_target_info)        
     
 
     # 保存当前帧图像
-    output_image_path = os.path.join(output_folder, f"output_image_0.png")
+    output_images_path = output_folder+ "images/"
+    output_masks_path = output_folder+ "masks/"
+    os.makedirs(output_images_path)
+    os.makedirs(output_masks_path)
+    output_image_path = os.path.join(output_images_path,f"output_image_0.png")
     cv2.imwrite(output_image_path, output_images[0])
     # 保存掩码图像
-    mask_output_path = os.path.join(output_folder, f"output_image_0_mask.png")
+    mask_output_path = os.path.join(output_masks_path, f"output_image_0_mask.png")
     cv2.imwrite(mask_output_path, output_images_mask[0])        
     #####################################################################################################
     
@@ -751,6 +909,7 @@ def MISTG(input_images, max_num_targets, output_folder):
         # print(update_target_pixel)
         # 更新像素值
         # 输入参数：初始帧参数，位移变化、旋转变化
+        target_background = current_gray
         for j in range(init_target_nums):
             shape_type = target_shape_ids[j]
             h = w = int(update_target_pixel[j]) # TODO 待优化
@@ -762,7 +921,7 @@ def MISTG(input_images, max_num_targets, output_folder):
             # 判断目标是否显示在图像中，只需要计算在现在这一帧图像内的目标，依据目标中心点和目标大小判定
             # 简化：忽略目标大小，仅依据中心点判定
             if (0+w) <= x < (img_w-w) and (0+h) <= y < (img_h-h):
-                img_target_background = current_gray[y:y+h, x:x+w]
+                img_target_background = target_background[y:y+h, x:x+w]
                 print(f"target {j}: y, x: {y}, {x}, h, w: {h}, {w}", shape_type)
                 
                 target_info = target_generator(img_target_background, 
@@ -779,30 +938,31 @@ def MISTG(input_images, max_num_targets, output_folder):
                 mask = target_info['mask']
                 # Generate targets and add them to the frame
                 output_images[i, y:y+h, x:x+w] = target 
-                output_images_mask[i, y:y+h, x:x+w] = mask
+                output_images_mask[i, y:y+h, x:x+w][mask > 0] = mask[mask > 0]
                 if shape_type == '3d_projection':
                     params = target_info['params']
                     current_rotation = params['rotation']
                     new_rotation = update_rotation(current_rotation, i, fps, params)
                     params['rotation'] = new_rotation
                     # 更新目标信息
-                    target_info['params'] = params
-                    
-        
+                    target_info['params'] = params 
+                                    
+                target_background = output_images[i]
+                
         # 保存当前帧图像
-        output_image_path = os.path.join(output_folder, f"output_image_{i}.png")
+        output_image_path = os.path.join(output_images_path, f"output_image_{i}.png")
         cv2.imwrite(output_image_path, output_images[i])
         # 保存掩码图像
-        mask_output_path = os.path.join(output_folder, f"output_image_{i}_mask.png")
-        cv2.imwrite(mask_output_path, output_images_mask[i])   
+        mask_output_path = os.path.join(output_masks_path, f"output_image_{i}_mask.png") 
+        cv2.imwrite(mask_output_path, output_images_mask[i]) 
     return output_images
     ######################################################################################################
 
 
 if __name__ == '__main__':
     # 参数配置
-    folder_path = "/home/guantp/Infrared/datasets/mydata/250110/M615/100_1min_4"   # Replace with your folder containing images
-    # folder_path = "/home/guantp/Infrared/MIRST/motive_target_gen/bg_imgs"
+    # folder_path = "/home/guantp/Infrared/datasets/mydata/250110/M615/100_1min_4"   # Replace with your folder containing images
+    folder_path = "/home/guantp/Infrared/MIRST/motive_target_gen/bg_imgs"
     # folder_path = "/home/guantp/Infrared/datasets/复杂背景下红外弱小运动目标检测数据集/train/100/"
     output_folder = "/home/guantp/Infrared/MIRST/motive_target_gen/motive_target_imgs/"
 
@@ -812,7 +972,7 @@ if __name__ == '__main__':
     # 重新创建文件夹
     os.makedirs(output_folder, exist_ok=True)
     
-    max_num_targets = 20
+    max_num_targets = 150
 
     input_images = load_images_from_folder(folder_path)
     output_images = MISTG(input_images, max_num_targets, output_folder)
