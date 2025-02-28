@@ -65,6 +65,15 @@ def generate_arrays(M, N):
 
     return arrays, corresponding_sums
 
+def natural_sort(file_list):
+    """按照人类直觉的方式对文件名进行排序（数字按大小排序）"""
+    def convert(text):
+        return int(text) if text.isdigit() else text.lower()
+    
+    def alphanum_key(key):
+        return [convert(c) for c in re.split('([0-9]+)', key)]
+    
+    return sorted(file_list, key=alphanum_key)
 
 def load_images_from_folder(folder):
     """
@@ -73,7 +82,8 @@ def load_images_from_folder(folder):
     images = []
 
     # Sort filenames alphabetically
-    for filename in sorted(os.listdir(folder)):
+    # import pdb; pdb.set_trace()
+    for filename in natural_sort(os.listdir(folder)):
         img_path = os.path.join(folder, filename)
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if img is not None:

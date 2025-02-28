@@ -24,7 +24,7 @@ from utils import (
     load_images_from_folder
 )
 
-def circle_gen(h, w, target, scale, background_std, background_mean, params):
+def circle_gen(background_area, h, w, target, scale, background_std, background_mean, params):
     """
     生成一个连续的不规则类圆形红外目标
     参数:
@@ -40,7 +40,7 @@ def circle_gen(h, w, target, scale, background_std, background_mean, params):
     返回:
     (target, mask, params): 处理后的图像、掩码和使用的参数
     """
-    
+    print(background_area)
     if params:
         radius=params['radius']
         irregularity=params['irregularity']
@@ -52,7 +52,7 @@ def circle_gen(h, w, target, scale, background_std, background_mean, params):
         
     center = (w // 2, h // 2)
     if radius is None:
-        radius = max(min(h, w) // 4, 1)
+        radius = max(min(h, w) // 2, 1)
     
     # 初始化或使用传入的不规则参数
     if irregularity is None:
@@ -120,16 +120,41 @@ def circle_gen(h, w, target, scale, background_std, background_mean, params):
     # 创建目标区域
     target_region = (dist_from_center * edge_noise) <= radius
     
-    # 形态学操作
-    kernel = np.ones((3, 3), np.uint8)
-    target_region = cv2.morphologyEx(target_region.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-    target_region = cv2.morphologyEx(target_region, cv2.MORPH_OPEN, kernel)
+    # # 形态学操作
+    # kernel = np.ones((3, 3), np.uint8)
+    # target_region = cv2.morphologyEx(target_region.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+    # target_region = cv2.morphologyEx(target_region, cv2.MORPH_OPEN, kernel)
     
     # 强度计算
     intensity = np.zeros((h, w))
     valid_region = target_region > 0
-    intensity[valid_region] = np.exp(-0.7 * (dist_from_center[valid_region] / radius)**1.5)
+    # intensity[valid_region] = np.exp(-0.7 * (dist_from_center[valid_region] / radius)**1.5)
     
+    
+    # 计算到目标边缘的距离场
+    dist_transform = cv2.distanceTransform((~valid_region).astype(np.uint8), cv2.DIST_L2, 5)
+    dist_transform_in = cv2.distanceTransform(valid_region.astype(np.uint8), cv2.DIST_L2, 5)
+    
+    # 定义过渡区域宽度
+    transition_width = 3.0  # 可以调整这个值来控制过渡区域的宽度
+    
+    # 创建过渡区域的mask
+    transition_mask_outer = (dist_transform < transition_width) & (~valid_region)
+    transition_mask_inner = (dist_transform_in < transition_width) & valid_region
+    
+    # 计算目标区域的强度
+    intensity[valid_region] = np.exp(-(dist_from_center[valid_region]**2) / (2 * min(h, w) / 6)**2)
+    max_intensity = np.max(intensity)
+    
+    # 计算外部过渡区域的强度
+    transition_weights_outer = (transition_width - dist_transform) / transition_width
+    transition_weights_outer[~transition_mask_outer] = 0
+    intensity[transition_mask_outer] = (max_intensity * 0.3) * transition_weights_outer[transition_mask_outer]
+    
+    # 计算内部过渡区域的强度
+    transition_weights_inner = dist_transform_in / transition_width
+    transition_weights_inner[~transition_mask_inner] = 1
+    intensity[valid_region] *= transition_weights_inner[valid_region]
     # 添加参数化的纹理
     texture_scale = cv2.GaussianBlur(
         np.ones((h, w)) * noise_params['texture_scale'], (5, 5), 2
@@ -137,25 +162,29 @@ def circle_gen(h, w, target, scale, background_std, background_mean, params):
     noise = cv2.GaussianBlur(
         np.random.normal(0, noise_params['noise_strength'], (h, w)), (3, 3), 1
     )
-    intensity = intensity * texture_scale + noise * intensity
-    
-    # 添加参数化的热点
-    for _ in range(noise_params['hotspot_count']):
-        offset = np.random.uniform(-radius*0.2, radius*0.2, 2)
-        hotspot_dist = np.sqrt((x - (center[0] + offset[0]))**2 + (y - (center[1] + offset[1]))**2)
-        hotspot = np.exp(-0.5 * (hotspot_dist / (radius * noise_params['hotspot_size']))**2) * noise_params['hotspot_intensity']
-        intensity += hotspot * (target_region > 0)
+    # intensity = intensity * texture_scale + noise * intensity
+    intensity = intensity * texture_scale + noise * (intensity - background_area.mean())
+    # # 添加参数化的热点
+    # for _ in range(noise_params['hotspot_count']):
+    #     offset = np.random.uniform(-radius*0.2, radius*0.2, 2)
+    #     hotspot_dist = np.sqrt((x - (center[0] + offset[0]))**2 + (y - (center[1] + offset[1]))**2)
+    #     hotspot = np.exp(-0.5 * (hotspot_dist / (radius * noise_params['hotspot_size']))**2) * noise_params['hotspot_intensity']
+    #     intensity += hotspot * (target_region > 0)
     
     # 最终处理
-    intensity = cv2.GaussianBlur(intensity, (3, 3), 0.5)
+    # intensity = cv2.GaussianBlur(intensity, (3, 3), 0.5)
     intensity = np.clip(intensity, 0, 1)
-    target_values = intensity * scale * background_std + background_mean
+    target_values = intensity * scale * background_std + background_area.mean()
     target_values = np.clip(target_values, 0, 255)
     
     # 更新目标区域
     target[valid_region] = target_values[valid_region]
     mask[valid_region] = 255
+
     
+    print(target)
+    import pdb
+    pdb.set_trace()
     # 返回使用的参数，便于下一帧使用
     used_params = {
         'radius': radius,
@@ -165,7 +194,7 @@ def circle_gen(h, w, target, scale, background_std, background_mean, params):
     
     return target, mask, used_params
 
-def ellipse_gen(h, w, target, scale, background_std, background_mean, params):
+def ellipse_gen(background_area, h, w, target, scale, background_std, background_mean, params):
     """
     生成一个连续的不规则类椭圆形红外目标
     参数:
@@ -471,7 +500,7 @@ def add_target_to_background(background, target_mask, target_size_ratio=0.1, pea
     
     return result, (start_x, start_y, new_w, new_h), mask_region
 
-def target_generator(target_background, shape_type, background_std, background_mean, background_diff, target_distance, base_distance=3000, params=None, models_library=None):
+def target_generator(background_area, target_background, shape_type, background_std, background_mean, background_diff, target_distance, base_distance=3000, params=None, models_library=None):
     """
     生成目标和对应的掩码
     参数:
@@ -500,11 +529,11 @@ def target_generator(target_background, shape_type, background_std, background_m
     
     # 目标初始化，根据形状类型生成目标
     if shape_type == 'circle':
-        target, mask, params = circle_gen(h, w, target_background, scale, background_std, background_mean, params)
+        target, mask, params = circle_gen(background_area, h, w, target_background, scale, background_std, background_mean, params)
         target_info = {'shape_type': 'circle', 'target': target, 'mask': mask, 'params': params}
 
     elif shape_type == 'ellipse':
-        target, mask, params = ellipse_gen(h, w, target_background, scale, background_std, background_mean, params)
+        target, mask, params = ellipse_gen(background_area, h, w, target_background, scale, background_std, background_mean, params)
         target_info = {'shape_type': 'ellipse', 'target': target, 'mask': mask, 'params': params}
 
     # elif shape_type == 'polygon':
@@ -562,7 +591,7 @@ def target_generator(target_background, shape_type, background_std, background_m
     return target_info
 
 
-def MISTG(input_images, max_num_targets, output_folder):
+def MISTG(input_images, max_num_targets, output_folder, video_idx):
     """
     Moving Infrared Small Target Generate and Background Alignment
     运动红外弱小目标生成与背景对齐
@@ -771,8 +800,9 @@ def MISTG(input_images, max_num_targets, output_folder):
             
             print(f"target {j}: y, x: {y}, {x}, h, w: {h}, {w}", shape_type)
             # print(img_target_background.shape)
-            
+            background_area = frist_target_background[y-h:y+2*h, x-w:x+2*w]
             init_target_info = target_generator(
+                background_area,
                 img_target_background, 
                 shape_type, 
                 background_std, 
@@ -804,14 +834,14 @@ def MISTG(input_images, max_num_targets, output_folder):
     
 
     # 保存当前帧图像
-    output_images_path = output_folder+ "images/"
-    output_masks_path = output_folder+ "masks/"
-    os.makedirs(output_images_path)
-    os.makedirs(output_masks_path)
-    output_image_path = os.path.join(output_images_path,f"output_image_0.png")
+    output_images_path = output_folder+ "images/" + video_idx + "/"
+    output_masks_path = output_folder+ "masks/" + video_idx + "/"
+    os.makedirs(output_images_path, exist_ok=True)
+    os.makedirs(output_masks_path, exist_ok=True)
+    output_image_path = os.path.join(output_images_path,f"0.png")
     cv2.imwrite(output_image_path, output_images[0])
     # 保存掩码图像
-    mask_output_path = os.path.join(output_masks_path, f"output_image_0_mask.png")
+    mask_output_path = os.path.join(output_masks_path, f"0_mask.png")
     cv2.imwrite(mask_output_path, output_images_mask[0])        
     #####################################################################################################
     
@@ -833,7 +863,7 @@ def MISTG(input_images, max_num_targets, output_folder):
                                                     max_acceleration_factor, 
                                                     size=init_target_nums)
     
-    targets_init_acceleration = np.random.randint(init_acceleration_range[0],
+    targets_init_acceleration = np.random.randint(init_acceleration_range[0], 
                                                   init_acceleration_range[1], 
                                                   size=init_target_nums)
     
@@ -869,24 +899,6 @@ def MISTG(input_images, max_num_targets, output_folder):
         img_h
     )  # 返回形状: [targets_num, img_num, 3]
         
-    if target_shape_ids[j] == '3d_projection':
-        params = target_params[j].copy()  # 复制基础参数
-        params['rotation'] = tuple(all_rotations[j][i])  # 添加当前帧的旋转参数
-    else:
-        params = None
-    
-    target_info = target_generator(
-        img_target_background, 
-        target_shape_ids[j],  # 使用记录的目标类型
-        background_std, 
-        background_mean, 
-        background_diff, 
-        z,
-        base_distance=base_distance,
-        params=params,
-        models_library=models_library
-    )
- 
       
     # 以第一帧的左下角作为整个场景的坐标原点（0,0），目标动态更新与计算，目标更新依据背景位移多少进行更新    
     for i in range(1, img_nums):
@@ -924,7 +936,9 @@ def MISTG(input_images, max_num_targets, output_folder):
                 img_target_background = target_background[y:y+h, x:x+w]
                 print(f"target {j}: y, x: {y}, {x}, h, w: {h}, {w}", shape_type)
                 
-                target_info = target_generator(img_target_background, 
+                background_area = target_background[y-h:y+2*h, x-w:x+2*w]
+                target_info = target_generator(background_area,
+                                               img_target_background, 
                                                shape_type, 
                                                background_std, 
                                                background_mean, 
@@ -939,31 +953,34 @@ def MISTG(input_images, max_num_targets, output_folder):
                 # Generate targets and add them to the frame
                 output_images[i, y:y+h, x:x+w] = target 
                 output_images_mask[i, y:y+h, x:x+w][mask > 0] = mask[mask > 0]
+                # if shape_type == '3d_projection':
+                #     params = target_info['params']
+                #     current_rotation = params['rotation']
+                #     new_rotation = update_rotation(current_rotation, i, fps, params)
+                #     params['rotation'] = new_rotation
+                #     # 更新目标信息
+                #     target_info['params'] = params 
                 if shape_type == '3d_projection':
-                    params = target_info['params']
-                    current_rotation = params['rotation']
-                    new_rotation = update_rotation(current_rotation, i, fps, params)
-                    params['rotation'] = new_rotation
-                    # 更新目标信息
-                    target_info['params'] = params 
-                                    
+                    target_info['params']['rotation'] = tuple(all_rotations[j][i])
                 target_background = output_images[i]
                 
         # 保存当前帧图像
-        output_image_path = os.path.join(output_images_path, f"output_image_{i}.png")
+        output_image_path = os.path.join(output_images_path, f"{i}.png")
         cv2.imwrite(output_image_path, output_images[i])
         # 保存掩码图像
-        mask_output_path = os.path.join(output_masks_path, f"output_image_{i}_mask.png") 
+        mask_output_path = os.path.join(output_masks_path, f"{i}_mask.png") 
         cv2.imwrite(mask_output_path, output_images_mask[i]) 
     return output_images
     ######################################################################################################
 
 
 if __name__ == '__main__':
-    # 参数配置
-    # folder_path = "/home/guantp/Infrared/datasets/mydata/250110/M615/100_1min_4"   # Replace with your folder containing images
-    folder_path = "/home/guantp/Infrared/MIRST/motive_target_gen/bg_imgs"
-    # folder_path = "/home/guantp/Infrared/datasets/复杂背景下红外弱小运动目标检测数据集/train/100/"
+    folder_paths = [
+        # "/home/guantp/Infrared/datasets/mydata/250110/M615/100_1min_4",
+        "/home/guantp/Infrared/MIRST/motive_target_gen/bg_imgs",
+        "/home/guantp/Infrared/datasets/复杂背景下红外弱小运动目标检测数据集/train/100"
+    ]
+    
     output_folder = "/home/guantp/Infrared/MIRST/motive_target_gen/motive_target_imgs/"
 
     # 如果输出文件夹存在，则删除整个文件夹
@@ -973,9 +990,11 @@ if __name__ == '__main__':
     os.makedirs(output_folder, exist_ok=True)
     
     max_num_targets = 150
-
-    input_images = load_images_from_folder(folder_path)
-    output_images = MISTG(input_images, max_num_targets, output_folder)
+    for folder_path in folder_paths:
+        print(f"Processing folder: {folder_path}")
+        video_idx = folder_path.split("/")[-1] if folder_path.split("/")[-1] != "" else folder_path.split("/")[-2]
+        input_images = load_images_from_folder(folder_path)
+        output_images = MISTG(input_images, max_num_targets, output_folder, video_idx)
     print("Moving Infrared Small Target Generate Finish.")
     
 # TODO 未完成部分以及优化
@@ -986,5 +1005,4 @@ if __name__ == '__main__':
 # 像素值根据距离和大气传输模型仿真优化
 # 设计合理的运动速度、加速度和变化率
 # 运动参数添加微弱随机扰动
-# 目标mask生成
 # 光流法优化
